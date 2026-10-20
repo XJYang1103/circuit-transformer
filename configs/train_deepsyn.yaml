@@ -1,41 +1,39 @@
-# Training config for the 8-input / 2-output random-circuit dataset whose
-# targets are optimised by `&deepsyn -T 1` in ABC.
+# 【YAML注意事项】
+# 缩进必须是空格，禁止 Tab，缩进错了直接解析报错
+# 大小写敏感：True 和 true 在很多 yaml 解析器都支持，但规范写小写 true/false
+# 冒号后面必须带空格：name: deepsyn ✅；name:deepsyn ❌
+# ~ 波浪号代表 Linux 家目录，yaml 本身不解析，由 python 代码处理
+# 一句话概括：YAML 就是写配置用的文本文件，这份文件就是用来一次性指定电路 Transformer 训练的全部参数。
+
+
+
+
+# 训练配置：8输入/2输出随机电路数据集，数据集目标由ABC工具中 `&deepsyn -T 1` 优化得到
 #
 #   python scripts/train.py --config configs/train_deepsyn.yaml
 #   python scripts/train.py --config configs/train_deepsyn.yaml --dry-run
 #
-# Paths may be absolute or start with ~ / $HOME; scripts/train.py expands them.
-# The training loop concatenates paths as plain strings and never expands `~`
-# itself, so expansion has to happen before the call.
+# 路径可以是绝对路径，也可以以 ~ / $HOME 开头；train.py 脚本会自动展开。
+# 训练循环仅把路径当成字符串拼接，不会自己解析 `~`，所以路径展开操作必须在调用脚本前完成。
 #
-# These values are the library defaults plus the settings the readme describes
-# for the published checkpoint. They are a starting point, not a tuned recipe:
-# the readme does not document the exact hyperparameters behind the released
-# `deepsyn_reinforced` weights, so treat epochs/batch_size as yours to choose.
-
+# 这些参数为库默认值，加上README中公开权重对应的配置。仅作为起点，不是调优好的最终方案：
+# README没有记录发布的 `deepsyn_reinforced` 权重对应的精确超参，所以轮数、批次大小需要自行调整。
 run:
-  # Runs are created as <output_root>/<timestamp>-<run_name>/.
+  # 实验输出目录格式：<output_root>/<时间戳>-<run_name>/
   name: deepsyn_8i2o
-
 paths:
-  # Directory holding the training .json files *directly* -- train() treats
-  # every entry of this directory as a training file. Populated by
-  # scripts/download_data.sh, which unzips the archive's top-level
-  # `8_inputs_2_outputs_random_deepsyn/` directory into train/.
+  # 存放训练json文件的目录，train()会把该目录下所有文件都当作训练文件。
+  # 目录由 scripts/download_data.sh 脚本下载解压得到，解压后顶层文件夹
+  # `8_inputs_2_outputs_random_deepsyn/` 放到train目录下。
   data_dir: ~/data/circuit-transformer/train/8_inputs_2_outputs_random_deepsyn
-
-  # Each run gets its own timestamped subdirectory so that differently tuned
-  # runs never overwrite each other's `model-<epoch>` files, which carry no
-  # task identifier of their own.
+  # 每次实验会生成带时间戳的独立子目录，保证不同调参实验不会互相覆盖
+  # 模型文件 `model-<epoch>`，模型文件名本身不带任务标识。
   output_root: ~/runs/circuit-transformer
-
 model:
-  # Constructor arguments for CircuitTransformer, spelled out rather than
-  # relying on the defaults so they are visible in one place.
+  # CircuitTransformer模型构造参数，全部显式写出，不依赖默认值，方便集中查看。
   #
-  # num_inputs must match the dataset: every circuit here has 8 inputs and
-  # 2 outputs. `optimize` will warn and truncate sequences that exceed
-  # max_seq_length.
+  # num_inputs必须和数据集匹配：本数据集所有电路都是8输入、2输出。
+  # `optimize`阶段如果序列超过max_seq_length会给出警告并截断序列。
   num_inputs: 8
   embedding_width: 512
   num_layers: 12
@@ -45,22 +43,18 @@ model:
   max_seq_length: 200
   mixed_precision: true
   verbose: 1
-
 train:
-  # Passed straight through to CircuitTransformer.train().
+  # 参数直接传给 CircuitTransformer.train()
   epochs: 10
   batch_size: 128
   validation_split: 0.1
   initial_epoch: 0
-
-  # false = keep one weight set per epoch. Each set is two files
-  # (.index + .data-00000-of-00001), so 10 epochs is 10 sets; set this to true
-  # to keep only the final epoch and save disk while you are experimenting.
+  # false = 每轮都保存一套权重。每套权重包含两个文件
+  # (.index + .data-00000-of-00001)，10轮训练就会保存10套；设置为true
+  # 只保留最后一轮权重，做实验时节省磁盘空间。
   latest_ckpt_only: false
-
-  # true = also write TensorBoard summaries into <run_dir>/tensorboard. This
-  # turns on the TF profiler (tf.summary.trace_on(profiler=True)), which adds
-  # measurable overhead, so leave it off unless you are profiling.
+  # true = 在 <run_dir>/tensorboard 目录下写入TensorBoard日志。
+  # 开启后会启用TF性能分析器(tf.summary.trace_on(profiler=True))，会带来一定性能开销，
+  # 除非做性能分析，否则保持关闭。
   profile: false
-
   distributed: false

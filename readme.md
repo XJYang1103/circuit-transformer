@@ -230,3 +230,36 @@ twine upload dist/circuit-transformer-x.x.tar.gz
     url={https://openreview.net/forum?id=kpnW12Lm9p}
 }
 ```
+
+# 框架
+## 1. configs/ —— 目录
+- 存放训练配置的目录。一个 YAML 文件 = 一种训练设置
+- 就是**把所有训练超参、路径、模型参数全部写在一个配置文件里**。
+### configs/train_deepsyn.yaml
+- run.name	拼进 run 目录名，用来区分实验
+- paths.*	data_dir 指向数据、output_root 是产物根目录。~ / $HOME 由 0 train.py 展开
+- model.*	原样展开成 CircuitTransformer(...) 的构造参数
+- train.*	原样展开成 train() 的关键字参数
+
+## 2.scripts/ —— 目录
+### scripts/train.py  
+
+读取YAML的配置运行模型：
+- 读 YAML → 展开路径 → 校验数据目录 → 建时间戳 run 目录
+- → 预建 ckpt/ 和 tensorboard/ → stdout/stderr 同时写进 train.log
+- → 构造 CircuitTransformer → 调 train()
+##  仓库外面那两个目录
+- `~/data/circuit-transformer/          ← 数据，不在 git 里`
+- ├── raw/     三个原始文件 + sha256 锁定
+- ├── train/   解压后的 508 万个 json
+- └── test/    random_circuits/ + IWLS_FFWs/  
+
+-` ~/runs/circuit-transformer/          ← 训练产物，不在 git 里`
+- └── <时间戳>-<名字>/
+-    ├── ckpt/          model-0001.index / .data-00000-of-00001
+-    ├── tensorboard/
+-    └── train.log
+
+
+
+
