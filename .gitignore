@@ -245,10 +245,7 @@ abc.history
 # ---------------------------------------------------------------------------
 # Datasets, checkpoints and training artifacts.
 #
-# None of this belongs in git: the datasets are re-downloadable (see
-# scripts/download_data.sh) and the checkpoints are reproducible from the code
-# plus a config. The repository proper is ~13 MB; a single copy of the training
-# dataset is 3.5 GB, which is well past GitHub's 100 MB per-file hard limit.
+# Keep large datasets, checkpoint files, and local migration test data out of Git.
 #
 # Layout these paths refer to:
 #   ~/data/circuit-transformer/   datasets, outside the repository
@@ -262,6 +259,7 @@ abc.history
 data/
 datasets/
 *.zip
+.migration/
 
 # Training outputs
 runs/
@@ -281,7 +279,3 @@ logs/
 *.pth
 *.pb
 *tfevents*
-
-
-
-

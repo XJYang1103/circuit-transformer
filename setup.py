@@ -9,13 +9,9 @@ setup(
     author='Xihan Li (snowkylin)',
     author_email='xihan.li@cs.ucl.ac.uk',
     description='An end-to-end Transformer model that efficiently produces logic circuits strictly equivalent to given Boolean functions.',
-    install_requires=["tensorflow[and-cuda]",
-                      "tf_keras",
-                      "tf-models-official",
-                      "npn",
-                      "graphviz",
-                      "nvidia-ml-py",
-                      "bitarray",
-                      "huggingface_hub"],
+    python_requires='>=3.10',
+    install_requires=["torch>=2.4", "numpy>=1.26", "scipy>=1.11", "PyYAML>=6.0", "npn",
+                      "graphviz", "nvidia-ml-py", "bitarray", "huggingface_hub"],
+    extras_require={"conversion": ["tensorflow>=2.18"], "test": ["pytest>=8"]},
     package_data={'circuit_transformer': ['bin/*']}
 )

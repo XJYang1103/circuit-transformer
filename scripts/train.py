@@ -1,27 +1,16 @@
 #!/usr/bin/env python3
-"""Train a Circuit Transformer from scratch, driven by a YAML config.
+"""Train the PyTorch Circuit Transformer with a YAML config on Linux.
 
-A thin CLI over `CircuitTransformer.train`. It exists because the training loop
-in circuit_transformer/model.py makes three assumptions that are easy to trip
-over from the outside:
-
-  * `train()` calls `os.mkdir`, not `os.makedirs`, on both `ckpt_save_path` and
-    `log_dir`. Every intermediate directory has to exist beforehand, or the run
-    dies with FileNotFoundError before the first epoch.
-  * `log_dir` defaults to the *relative* path "tensorboard", which lands inside
-    the repository when you run from the repo root.
-  * Paths are concatenated as plain strings, so a literal "~" is never
-    expanded -- it would be read as a directory actually named "~".
-
-This script expands and validates the paths, creates the run directory, and
-passes absolute paths through.
+This CLI expands and validates paths, creates one directory per run, and
+passes the configured model and training options to CircuitTransformer.
+The model and its training loop remain in the circuit_transformer package.
 
 Layout produced and consumed (see readme.md for the project conventions):
 
     ~/data/circuit-transformer/train/<dataset>/     .json training files
     ~/runs/circuit-transformer/<timestamp>-<name>/
-        ckpt/           model-<epoch>.index + model-<epoch>.data-00000-of-00001
-        tensorboard/    summaries, written when `train.profile` is true
+        ckpt/           model-<epoch>.pt
+        tensorboard/    PyTorch profiler traces when `train.profile` is true
         train.log       stdout/stderr of this run
 
 Usage:
@@ -35,14 +24,15 @@ import argparse
 import datetime
 import os
 import sys
+from pathlib import Path
+
+
+# Running `python scripts/train.py` sets sys.path to scripts/, not the checkout.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
 def resolve(path):
-    """Expand ~ and $VARS, then make the result absolute.
-
-    `CircuitTransformer.train` builds file paths by plain string concatenation,
-    so nothing downstream would ever expand a "~" for us.
-    """
+    """Expand ~ and $VARS, then make the result absolute."""
     return os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
 
 
@@ -65,9 +55,9 @@ def load_config(path):
 
 
 def check_data_dir(path):
-    """Validate the directory the way `train()` is going to consume it.
+    """Validate the directory the way `train()` consumes it.
 
-    `train()` does `os.listdir(train_data_dir)` and then treats *every* entry as
+    `train()` lists every directory entry and treats it as
     a training file -- it does not filter by extension. A nested subdirectory
     therefore passes `listdir` and only blows up much later, inside the data
     pipeline, where the error is hard to read. Catching it here is worth the
@@ -132,13 +122,15 @@ def main(argv=None):
     parser.add_argument('--run-name', help='override run.name')
     parser.add_argument('--epochs', type=int, help='override train.epochs')
     parser.add_argument('--batch-size', type=int, help='override train.batch_size')
-    parser.add_argument('--resume', metavar='CKPT_PREFIX',
-                        help='continue from a checkpoint prefix, e.g. '
-                             '~/runs/circuit-transformer/<run>/ckpt/model-0010 '
-                             '(no .index suffix)')
+    parser.add_argument('--device', help='override model.device (e.g. cuda or cpu)')
+    parser.add_argument('--num-workers', type=int,
+                        help='override train.num_workers (default 8; preserves original loader)')
+    parser.add_argument('--resume', metavar='WEIGHTS_PT',
+                        help='initialize model weights from a .pt file; optimizer and '
+                             'learning-rate step are reset as in the original train()')
     parser.add_argument('--dry-run', action='store_true',
                         help='print the resolved plan and exit; imports no '
-                             'TensorFlow, so it works before the env is set up')
+                             'PyTorch, so it works before the env is set up')
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
@@ -160,6 +152,10 @@ def main(argv=None):
         train_cfg['epochs'] = args.epochs
     if args.batch_size is not None:
         train_cfg['batch_size'] = args.batch_size
+    if args.device is not None:
+        model_cfg['device'] = args.device
+    if args.num_workers is not None:
+        train_cfg['num_workers'] = args.num_workers
 
     num_files = check_data_dir(data_dir)
 
@@ -173,13 +169,14 @@ def main(argv=None):
     print("Run directory: %s" % run_dir)
     print("Checkpoints  : %s" % ckpt_dir)
     print("Epochs/batch : %s / %s" % (train_cfg.get('epochs'), train_cfg.get('batch_size')))
+    print("Device/workers: %s / %s" % (model_cfg.get('device', 'auto'),
+                                     train_cfg.get('num_workers', 8)))
 
     if args.dry_run:
         print("\n--dry-run: plan resolved, nothing was trained.")
         return 0
 
-    # `train()` uses os.mkdir on both of these, which does not create
-    # intermediate directories -- so build the whole chain up front.
+    # Keep the run directory ready for both checkpoints and optional traces.
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
 
@@ -200,8 +197,7 @@ def main(argv=None):
 
     model = ct.CircuitTransformer(**model_cfg)
 
-    # Always pass an absolute log_dir: the default is the relative path
-    # "tensorboard", which would be created inside the repository.
+    # Keep optional PyTorch profiler traces with this run.
     train_cfg['log_dir'] = log_dir
 
     model.train(train_data_dir=data_dir,
@@ -209,7 +205,7 @@ def main(argv=None):
                 **train_cfg)
 
     print("\nDone. Checkpoints in %s" % ckpt_dir)
-    print("Load one with: CircuitTransformer(ckpt_path='%s/model-XXXX')"
+    print("Load one with: CircuitTransformer(ckpt_path='%s/model-XXXX.pt')"
           % ckpt_dir)
     return 0
 
