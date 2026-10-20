@@ -1,0 +1,66 @@
+# Training config for the 8-input / 2-output random-circuit dataset whose
+# targets are optimised by `&deepsyn -T 1` in ABC.
+#
+#   python scripts/train.py --config configs/train_deepsyn.yaml
+#   python scripts/train.py --config configs/train_deepsyn.yaml --dry-run
+#
+# Paths may be absolute or start with ~ / $HOME; scripts/train.py expands them.
+# The training loop concatenates paths as plain strings and never expands `~`
+# itself, so expansion has to happen before the call.
+#
+# These values are the library defaults plus the settings the readme describes
+# for the published checkpoint. They are a starting point, not a tuned recipe:
+# the readme does not document the exact hyperparameters behind the released
+# `deepsyn_reinforced` weights, so treat epochs/batch_size as yours to choose.
+
+run:
+  # Runs are created as <output_root>/<timestamp>-<run_name>/.
+  name: deepsyn_8i2o
+
+paths:
+  # Directory holding the training .json files *directly* -- train() treats
+  # every entry of this directory as a training file. Populated by
+  # scripts/download_data.sh, which unzips the archive's top-level
+  # `8_inputs_2_outputs_random_deepsyn/` directory into train/.
+  data_dir: ~/data/circuit-transformer/train/8_inputs_2_outputs_random_deepsyn
+
+  # Each run gets its own timestamped subdirectory so that differently tuned
+  # runs never overwrite each other's `model-<epoch>` files, which carry no
+  # task identifier of their own.
+  output_root: ~/runs/circuit-transformer
+
+model:
+  # Constructor arguments for CircuitTransformer, spelled out rather than
+  # relying on the defaults so they are visible in one place.
+  #
+  # num_inputs must match the dataset: every circuit here has 8 inputs and
+  # 2 outputs. `optimize` will warn and truncate sequences that exceed
+  # max_seq_length.
+  num_inputs: 8
+  embedding_width: 512
+  num_layers: 12
+  num_attention_heads: 8
+  intermediate_size: 2048
+  max_tree_depth: 32
+  max_seq_length: 200
+  mixed_precision: true
+  verbose: 1
+
+train:
+  # Passed straight through to CircuitTransformer.train().
+  epochs: 10
+  batch_size: 128
+  validation_split: 0.1
+  initial_epoch: 0
+
+  # false = keep one weight set per epoch. Each set is two files
+  # (.index + .data-00000-of-00001), so 10 epochs is 10 sets; set this to true
+  # to keep only the final epoch and save disk while you are experimenting.
+  latest_ckpt_only: false
+
+  # true = also write TensorBoard summaries into <run_dir>/tensorboard. This
+  # turns on the TF profiler (tf.summary.trace_on(profiler=True)), which adds
+  # measurable overhead, so leave it off unless you are profiling.
+  profile: false
+
+  distributed: false

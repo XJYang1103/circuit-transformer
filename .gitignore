@@ -242,3 +242,46 @@ cython_debug/
 .idea/
 abc.history
 
+# ---------------------------------------------------------------------------
+# Datasets, checkpoints and training artifacts.
+#
+# None of this belongs in git: the datasets are re-downloadable (see
+# scripts/download_data.sh) and the checkpoints are reproducible from the code
+# plus a config. The repository proper is ~13 MB; a single copy of the training
+# dataset is 3.5 GB, which is well past GitHub's 100 MB per-file hard limit.
+#
+# Layout these paths refer to:
+#   ~/data/circuit-transformer/   datasets, outside the repository
+#   ~/runs/circuit-transformer/   checkpoints and summaries, outside the repo
+# ---------------------------------------------------------------------------
+
+# Dataset locations. `data/` is only listed so that a stray in-repo copy is
+# caught; the real data lives in ~/data. If you ever need to commit a small
+# fixture, un-ignore it explicitly with a negated rule, e.g.
+#     !tests/fixtures/sample_circuits.zip
+data/
+datasets/
+*.zip
+
+# Training outputs
+runs/
+outputs/
+checkpoints/
+ckpt/
+tensorboard/
+logs/
+
+# TensorFlow / Keras weights. A tf.train.Checkpoint with prefix `model-0010`
+# produces `model-0010.index` plus `model-0010.data-00000-of-00001`.
+*.index
+*.data-00000-of-00001
+*.ckpt
+*.h5
+*.safetensors
+*.pth
+*.pb
+*tfevents*
+
+
+
+
