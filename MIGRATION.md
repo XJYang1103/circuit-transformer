@@ -28,6 +28,19 @@ python -m pip install -e .
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
+远端提交 `cd4b2eb` 的 `configs/train_deepsyn.yaml`、`scripts/train.py` 和
+`scripts/download_data.sh` 已合入。训练入口继续使用原来的数据目录、时间戳运行目录
+和日志布局；输出权重改为 `ckpt/model-0001.pt`。先检查配置中的服务器路径，再执行：
+
+```bash
+python scripts/train.py --config configs/train_deepsyn.yaml --dry-run
+python scripts/train.py --config configs/train_deepsyn.yaml
+```
+
+`--resume /path/model-0010.pt` 从模型权重开始新训练；与原版训练入口相同，
+优化器状态和学习率步数不会恢复。`initial_epoch` 只决定循环起点，不恢复优化器。
+配置文件默认 `device: cuda`、`num_workers: 8`；训练脚本支持命令行覆盖。
+
 ```python
 import circuit_transformer as ct
 

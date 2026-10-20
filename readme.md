@@ -38,6 +38,23 @@ Load native weights with
 Native `.pt` training and inference do not import TensorFlow. The existing
 `load_from_hf()` auto-download path needs TensorFlow only for the first conversion.
 
+## Train on Linux
+
+The repository includes a YAML-driven PyTorch training entry point. Edit
+`configs/train_deepsyn.yaml` for your server paths and training settings, then run:
+
+```bash
+python scripts/train.py --config configs/train_deepsyn.yaml --dry-run
+python scripts/train.py --config configs/train_deepsyn.yaml
+```
+
+`scripts/download_data.sh` retains the dataset download layout. Each run is
+written beneath the configured output root with `.pt` weights and a `train.log`.
+The default eight-process data reader keeps the original asynchronous loading
+behavior. `--resume /path/model-0010.pt` loads model weights, but training starts
+with a new optimizer and learning-rate schedule, as in the original `train()`.
+See [MIGRATION.md](MIGRATION.md) for details and server acceptance tests.
+
 You need to install GraphViz separately as follows if you need to visualize the network.
 
 ```bash
