@@ -26,7 +26,7 @@ def test_yaml_cli_dry_run_and_train(tmp_path):
         'model': {'num_inputs': 2, 'embedding_width': 64, 'num_layers': 2,
                   'num_attention_heads': 2, 'intermediate_size': 24,
                   'max_tree_depth': 32, 'max_seq_length': 12,
-                  'mixed_precision': False, 'device': 'cuda'},
+                  'mixed_precision': True, 'device': 'cuda'},
         'train': {'epochs': 1, 'batch_size': 2, 'validation_split': 0.25,
                   'num_workers': 8},
     }))
