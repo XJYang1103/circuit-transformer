@@ -242,3 +242,7 @@ cython_debug/
 .idea/
 abc.history
 
+
+# Local migration environments and downloaded checkpoints
+.migration/
+checkpoints/*.pt

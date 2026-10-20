@@ -22,10 +22,8 @@ import time
 import json
 import sys
 import tracemalloc
-import tensorflow as tf
-import tf_keras as keras
-from tensorflow_models import nlp
-from circuit_transformer.tensorflow_transformer import Seq2SeqTransformer, CustomSchedule, masked_loss, masked_accuracy
+import torch
+from circuit_transformer.pytorch_transformer import Seq2SeqTransformer
 from circuit_transformer.utils import *
 
 
@@ -459,7 +457,8 @@ class CircuitTransformer:
                  ckpt_path=None,
                  batch_size=None,
                  add_action_mask_to_input=False,
-                 policy_temperature_in_mcts=1.
+                 policy_temperature_in_mcts=1.,
+                 device=None
                  ):
         self.num_inputs = num_inputs
         self.vocab_size = 2 + 2 * self.num_inputs + 2
@@ -477,47 +476,31 @@ class CircuitTransformer:
         self.add_action_mask_to_input = add_action_mask_to_input
         self.policy_temperature_in_mcts = policy_temperature_in_mcts
 
-        # https://www.tensorflow.org/guide/mixed_precision
-        if mixed_precision:
-            keras.mixed_precision.set_global_policy('mixed_float16')
-        self._transformer = self._get_tf_transformer()
-
-        if self.ckpt_path is not None:
-            self.load(self.ckpt_path)
-
-        @tf.function(reduce_retracing=True)
-        def _transformer_inference_graph(self, inputs, return_kv_cache=False, return_last_token=False):
-            policy, cache = self._transformer(inputs, return_kv_cache=return_kv_cache, return_last_token=return_last_token)
-            return policy, cache
-
-        def _transformer_inference(self, inputs, return_kv_cache=False, return_last_token=False):
-            policy, cache = _transformer_inference_graph(self, inputs, return_kv_cache=return_kv_cache, return_last_token=return_last_token)
-            return policy.numpy(), cache
-
-        self._transformer_inference = types.MethodType(_transformer_inference, self)
+        self.device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
+        self.mixed_precision = mixed_precision
+        self._transformer = self._get_torch_transformer().to(self.device)
+        self._transformer.eval()
         self._transformer.return_cache = True
         self.use_kv_cache = True
         self.input_tt = compute_input_tt(self.num_inputs)
+        if self.ckpt_path is not None:
+            self.load(self.ckpt_path)
 
-    def _get_tf_transformer(self):
+    def _get_torch_transformer(self):
         return Seq2SeqTransformer(
-            enc_vocab_size=self.vocab_size,
-            dec_vocab_size=self.vocab_size,
-            embedding_width=self.embedding_width,
-            encoder_layer=nlp.models.TransformerEncoder(
-                num_layers=self.num_layers,
-                num_attention_heads=self.num_attention_heads,
-                intermediate_size=self.intermediate_size
-            ),
-            decoder_layer=nlp.models.TransformerDecoder(
-                num_layers=self.num_layers,
-                num_attention_heads=self.num_attention_heads,
-                intermediate_size=self.intermediate_size
-            ),
-            eos_id=self.eos_id,
-            max_tree_depth=self.max_tree_depth,
-            add_action_mask_to_inputs=self.add_action_mask_to_input
-        )
+            enc_vocab_size=self.vocab_size, dec_vocab_size=self.vocab_size,
+            embedding_width=self.embedding_width, num_layers=self.num_layers,
+            num_attention_heads=self.num_attention_heads, intermediate_size=self.intermediate_size,
+            eos_id=self.eos_id, max_tree_depth=self.max_tree_depth,
+            add_action_mask_to_inputs=self.add_action_mask_to_input,
+            mixed_precision=self.mixed_precision)
+
+    @torch.inference_mode()
+    def _transformer_inference(self, inputs, return_kv_cache=False, return_last_token=False):
+        self._transformer.eval()
+        policy, cache = self._transformer(inputs, return_kv_cache=return_kv_cache,
+                                           return_last_token=return_last_token)
+        return policy.cpu().numpy(), cache
 
     def _copy_env(self, env: LogicNetworkEnv | list[LogicNetworkEnv]):
         if isinstance(env, list):
@@ -573,7 +556,7 @@ class CircuitTransformer:
         targets = np.zeros((batch_size, 1), dtype=np.int32)
         dec_pos_encoding = np.zeros((batch_size, 1, self.max_tree_depth * 2), dtype=np.float32)
         if cache is not None and num_leaf_parallelization > 1:
-            cache['encoder_outputs'] = np.concatenate([cache['encoder_outputs']] * num_leaf_parallelization, axis=0)
+            cache['encoder_outputs'] = torch.cat([cache['encoder_outputs']] * num_leaf_parallelization, dim=0)
         transformer_time = 0.
         action_mask_time = 0.
         step_time = 0.
@@ -824,18 +807,29 @@ class CircuitTransformer:
                                  dtype=np.float32)
         return seq_enc, pos_enc
 
+    def save(self, ckpt_path):
+        from circuit_transformer.checkpoints import save_checkpoint
+        save_checkpoint(self._transformer, ckpt_path)
+
     def load(self, ckpt_path):
-        self._transformer.load_weights(ckpt_path)
-        self.ckpt_path = ckpt_path
+        from circuit_transformer.checkpoints import load_checkpoint
+        load_checkpoint(self._transformer, ckpt_path)
+        self.ckpt_path = os.fspath(ckpt_path)
 
     def load_from_hf(self, hf_model_name="deepsyn_reinforced"):
         from huggingface_hub import hf_hub_download
+        from pathlib import Path
+        # The upstream repository publishes TensorFlow prefixes. Convert once,
+        # then load the cached native PyTorch state without importing TensorFlow.
         index_path = hf_hub_download(repo_id="snowkylin/circuit-transformer", filename="%s.index" % hf_model_name)
-        data_path = hf_hub_download(repo_id="snowkylin/circuit-transformer", filename="%s.data-00000-of-00001" % hf_model_name)
         ckpt_path = index_path[:-6]
-        print("checkpoint downloaded to %s" % ckpt_path)
-        self._transformer.load_weights(ckpt_path)
-        self.ckpt_path = index_path
+        native_path = str(Path(index_path).parent / (hf_model_name + '.pt'))
+        if os.path.exists(native_path):
+            self.load(native_path)
+            return
+        hf_hub_download(repo_id="snowkylin/circuit-transformer", filename="%s.data-00000-of-00001" % hf_model_name)
+        self.load(ckpt_path)
+        self.save(native_path)
 
     def generate_action_masks(self, tts, input_tt, care_set_tts, seq_enc, use_controllability_dont_care, tts_compressed=None, ffw = None):
         env = LogicNetworkEnv(tts,
@@ -896,141 +890,14 @@ class CircuitTransformer:
         }
         return inputs, opt_seq_enc
 
-    def train(self,
-              train_data_dir,
-              ckpt_save_path=None,
-              validation_split=0.1,
-              epochs=10,
-              initial_epoch=0,
-              batch_size=128,
-              profile=False,
-              distributed=False,
-              latest_ckpt_only=False,
-              log_dir='tensorboard',
-              excluded_files: list = None
-              ):
-        train_data_dir = train_data_dir + ("/" if train_data_dir[-1] != "/" else "")
-        if ckpt_save_path is None:
-            print("WARNING: ckpt_save_path is not specified, the trained model will not be saved during training!")
-        else:
-            ckpt_save_path = ckpt_save_path + ("/" if ckpt_save_path[-1] != "/" else "")
-
-            if not os.path.exists(ckpt_save_path):
-                os.mkdir(ckpt_save_path)
-
-        train_files = os.listdir(train_data_dir)
-        print("%d training files listed" % len(train_files))
-        train_files.sort()
-        print("training files sorted")
-        np.random.seed(0)
-        np.random.shuffle(train_files)
-        print("training files shuffled")
-
-        self._transformer.return_cache = False
-
-        if excluded_files is not None:
-            print("excluded files is not None, filtering training files...")
-            excluded_files = set(excluded_files)
-            new_train_files = []
-            for file in train_files:
-                if file not in excluded_files:
-                    new_train_files.append(file)
-            print("training files filtered, from %d to %d" % (len(train_files), len(new_train_files)))
-            train_files = new_train_files
-
-        train_files = [(train_data_dir + file) for file in train_files]
-        self_copied = copy.copy(self)
-        self_copied._transformer = None
-        self_copied._transformer_inference = None
-
-        mp_dataset = MPDataset(train_files, self_copied.load_and_encode_formatted, validation_split=validation_split, num_processes=8)
-
-        output_signature = (
-            {
-                'inputs': tf.TensorSpec(shape=(self.max_seq_length,), dtype=tf.int32),
-                'enc_pos_encoding': tf.TensorSpec(shape=(self.max_seq_length, self.max_tree_depth * 2),
-                                                  dtype=tf.float32),
-                'targets': tf.TensorSpec(shape=(self.max_seq_length,), dtype=tf.int32),
-                'dec_pos_encoding': tf.TensorSpec(shape=(self.max_seq_length, self.max_tree_depth * 2),
-                                                  dtype=tf.float32),
-                'enc_action_mask': tf.TensorSpec(shape=(self.max_seq_length, self.vocab_size),
-                                                 dtype=tf.bool),
-                'dec_action_mask': tf.TensorSpec(shape=(self.max_seq_length, self.vocab_size),
-                                                  dtype=tf.bool)
-            }, tf.TensorSpec(shape=(self.max_seq_length,), dtype=tf.int32)
-        )
-
-        train_dataset = tf.data.Dataset.from_generator(mp_dataset.train_generator,
-                                                       output_signature=output_signature) \
-            .batch(batch_size).prefetch(tf.data.AUTOTUNE)
-        validation_dataset = tf.data.Dataset.from_generator(mp_dataset.validation_generator,
-                                                            output_signature=output_signature) \
-            .batch(batch_size).prefetch(tf.data.AUTOTUNE)
-
-        if profile:
-            if not os.path.exists(log_dir):
-                os.mkdir(log_dir)
-            summary_writer = tf.summary.create_file_writer(log_dir)
-            tf.summary.trace_on(profiler=True)
-
-        if distributed:
-            mirrored_strategy = tf.distribute.MirroredStrategy()
-            with mirrored_strategy.scope():
-                transformer = self._get_tf_transformer()
-                if self.ckpt_path is not None:
-                    transformer.load_weights(self.ckpt_path)
-                learning_rate = CustomSchedule(self.embedding_width)
-                optimizer = keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98, epsilon=1e-9)
-                transformer.compile(
-                    optimizer=optimizer,
-                    loss=masked_loss,
-                    metrics=[masked_accuracy]
-                )
-        else:
-            transformer = self._transformer
-            learning_rate = CustomSchedule(self.embedding_width)
-            optimizer = keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98, epsilon=1e-9)
-            transformer.compile(
-                optimizer=optimizer,
-                loss=masked_loss,
-                metrics=[masked_accuracy],
-            )
-
-        class LogCallback(keras.callbacks.Callback):
-            def on_train_batch_end(self, batch, logs=None):
-                # print(logs)
-                pass
-
-            def on_epoch_end(self, epoch, logs=None):
-                snapshot = tracemalloc.take_snapshot()
-                top_stats = snapshot.statistics('lineno')
-                for stat in top_stats:
-                    print(stat)
-
-
-        log = LogCallback()
-
-        callbacks = []
-        if ckpt_save_path is not None:
-            checkpoint = keras.callbacks.ModelCheckpoint(
-                filepath=ckpt_save_path + 'model-{epoch:04d}',
-                save_weights_only=True,
-                save_freq=(len(mp_dataset) * (epochs - initial_epoch) // batch_size) if latest_ckpt_only else 'epoch')
-            callbacks.append(checkpoint)
-
-        transformer.fit(train_dataset,
-                        initial_epoch=initial_epoch,
-                        epochs=epochs,
-                        validation_data=validation_dataset,
-                        callbacks=callbacks)
-        mp_dataset.process.terminate()
-        print("training finished")
-
-        if profile:
-            with summary_writer.as_default():
-                tf.summary.trace_export(name="model_trace", profiler_outdir=log_dir)
-
-        self._transformer.return_cache = True
+    def train(self, train_data_dir, ckpt_save_path=None, validation_split=0.1,
+              epochs=10, initial_epoch=0, batch_size=128, profile=False,
+              distributed=False, latest_ckpt_only=False, log_dir='tensorboard',
+              excluded_files=None, num_workers=8):
+        from circuit_transformer.training import train_circuit
+        return train_circuit(self, train_data_dir, ckpt_save_path, validation_split,
+                             epochs, initial_epoch, batch_size, profile, distributed,
+                             latest_ckpt_only, log_dir, excluded_files, num_workers)
 
     def optimize(self,
                  aigs: list,

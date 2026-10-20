@@ -12,22 +12,31 @@ https://github.com/user-attachments/assets/dead7905-ec49-4614-ab21-b6f2dc692f34
 
 ## Install
 
-Circuit Transformer is available on PyPI as `circuit-transformer`.
+Circuit Transformer now uses **PyTorch** as its runtime backend. Python 3.12
+is supported. Install a PyTorch build suitable for your Linux server's CUDA
+version, then install this checkout:
 
 ```bash
-pip install circuit-transformer
+python -m pip install -e .
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-Circuit Transformer use [TensorFlow](https://www.tensorflow.org) as the backend. GPU acceleration is highly recommended for significantly faster inference, which requires
+See [MIGRATION.md](MIGRATION.md) for equivalence tests, preserved training-loader
+behavior, numerical limitations, and server validation instructions. The default
+8-process data loading behavior is preserved.
 
-- An NVIDIA GPU with CUDA support
-- Linux environment (for Windows, you can use WSL2)
-
-More details can be found [here](https://www.tensorflow.org/install/pip). To verify the GPU status, please run
+The upstream pretrained files are TensorFlow checkpoints. Convert them once in
+an environment with TensorFlow, then copy the native `.pt` file to your server:
 
 ```bash
-python3 -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
+python -m pip install -e '.[conversion]'
+python -m circuit_transformer.convert_checkpoint /path/deepsyn_reinforced /path/deepsyn_reinforced.pt
 ```
+
+Load native weights with
+`ct.CircuitTransformer(ckpt_path='/path/deepsyn_reinforced.pt', device='cuda')`.
+Native `.pt` training and inference do not import TensorFlow. The existing
+`load_from_hf()` auto-download path needs TensorFlow only for the first conversion.
 
 You need to install GraphViz separately as follows if you need to visualize the network.
 

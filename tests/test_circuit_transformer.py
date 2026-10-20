@@ -1,7 +1,11 @@
 import bitarray
 import circuit_transformer as ct
+import os
+import pytest
 
 
+@pytest.mark.skipif(os.environ.get('CT_RUN_PRETRAINED_TESTS') != '1',
+                    reason='Opt-in integration test downloads the full pretrained model')
 def test_circuit_transformer():
 
     # load a logic network with And-Inverter Graph (AIG) format
@@ -16,11 +20,13 @@ def test_circuit_transformer():
 """)
 
     circuit_transformer = ct.CircuitTransformer()
+    circuit_transformer.load_from_hf()
     # Circuit Transformer works with batch operation
     # i.e., optimize multiple aigs simultaneously
     aigs = [aig]
     optimized_aigs = circuit_transformer.optimize(aigs)  # batch operation that accepts a list of aigs
     optimized_aig = optimized_aigs[0]
+    assert ct.compute_tts(aig, 8) == ct.compute_tts(optimized_aig, 8)
 
     print("Optimized AIG: \n%s\n#(AND) from %d to %d, equivalence check: %r" %
           (ct.write_aiger(optimized_aig), ct.count_num_ands(aig),
@@ -34,18 +40,21 @@ def test_circuit_transformer():
         num_mcts_playouts_per_step=2   # number of MCTS playouts
     )
     optimized_aig_with_mcts = optimized_aigs_with_mcts[0]
+    assert ct.compute_tts(aig, 8) == ct.compute_tts(optimized_aig_with_mcts, 8)
     print("Optimized AIG: \n%s\n#(AND) from %d to %d, equivalence check: %r" %
           (ct.write_aiger(optimized_aig_with_mcts), ct.count_num_ands(aig),
            ct.count_num_ands(optimized_aig_with_mcts), ct.cec(aig, optimized_aig)))
 
 
-def test_training():
+@pytest.mark.skipif(not os.environ.get('CT_TRAIN_DATA_DIR'),
+                    reason='Requires a real training dataset; small synthetic training is tested separately')
+def test_training(tmp_path):
     circuit_transformer = ct.CircuitTransformer()
     # circuit_transformer.load_from_hf()
     circuit_transformer.train(
         # train_data_dir='/home/snowkylin/8_inputs_2_outputs_reordered_test/',
-        train_data_dir='/home/snowkylin/data/circuits/8_inputs_2_outputs_new_filtered_10000_enhanced/',
-        ckpt_save_path='/home/snowkylin/test_ckpt/',
+        train_data_dir=os.environ['CT_TRAIN_DATA_DIR'],
+        ckpt_save_path=str(tmp_path / 'checkpoints'),
         batch_size=64
     )
 
