@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from test_pytorch_migration import SearchOptions
 
 PREFIX = os.environ.get('CT_TF_CHECKPOINT')
 pytestmark = pytest.mark.skipif(not PREFIX, reason='Set CT_TF_CHECKPOINT to the upstream TF prefix')
@@ -50,9 +51,10 @@ def test_pretrained_greedy_mcts_and_truth_tables(mixed, tmp_path):
         result = old_inference(inputs, **kwargs)
         old_scores.append(result[0])
         return result
-    def compare(inputs, **kwargs):
+    def compare(inputs, return_kv_cache=False, return_last_token=False):
         nonlocal max_error, calls
-        result = new_inference(inputs, **kwargs)
+        result = new_inference(inputs, return_kv_cache=return_kv_cache,
+                               return_last_token=return_last_token)
         expected = old_scores[calls]
         legal = expected > np.finfo(np.float32).min
         error = np.abs(result[0][legal] - expected[legal]).max(initial=0.)
@@ -69,9 +71,9 @@ def test_pretrained_greedy_mcts_and_truth_tables(mixed, tmp_path):
     for mcts in (0, 1):
         old_scores.clear()
         calls = 0
-        options = dict(max_inference_seq_length=100, num_mcts_steps=mcts,
-                       num_leaf_parallelization=2, num_mcts_playouts_per_step=2,
-                       return_envs=True)
+        options = SearchOptions(max_inference_seq_length=100, num_mcts_steps=mcts,
+                                num_leaf_parallelization=2, num_mcts_playouts_per_step=2,
+                                return_envs=True)
         with tf.device(reference_device):
             before = old.optimize_batch([original], **options)
         after = new.optimize_batch([original], **options)

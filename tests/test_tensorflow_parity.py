@@ -1,15 +1,16 @@
 """Real cross-framework comparisons, optional only when TF is not installed."""
 import numpy as np
 import random
+import subprocess
+import sys
 import pytest
 import torch
 
 tf = pytest.importorskip('tensorflow')
-pytest.importorskip('tf_keras')
+tf_keras = pytest.importorskip('tf_keras')
 pytest.importorskip('official')
-import tf_keras
 from reference.loader import load_reference, load_reference_circuit
-from test_pytorch_migration import features, small_circuit, aig_pair
+from test_pytorch_migration import features, small_circuit, aig_pair, SearchOptions
 from circuit_transformer.checkpoints import parameter_mapping, load_tensorflow_checkpoint
 from circuit_transformer.pytorch_transformer import masked_loss, masked_accuracy, CustomSchedule, KerasAdam
 
@@ -24,9 +25,9 @@ def pair(tmp_path, candidate=False, mixed=False):
     reference = load_reference()
     from official.nlp.modeling.models.seq2seq_transformer import TransformerEncoder, TransformerDecoder
     old = reference.Seq2SeqTransformer(enc_vocab_size=8, dec_vocab_size=8,
-        embedding_width=64, max_tree_depth=32, add_action_mask_to_inputs=candidate,
-        encoder_layer=TransformerEncoder(num_layers=2, num_attention_heads=2, intermediate_size=24),
-        decoder_layer=TransformerDecoder(num_layers=2, num_attention_heads=2, intermediate_size=24))
+                                       embedding_width=64, max_tree_depth=32, add_action_mask_to_inputs=candidate,
+                                       encoder_layer=TransformerEncoder(num_layers=2, num_attention_heads=2, intermediate_size=24),
+                                       decoder_layer=TransformerDecoder(num_layers=2, num_attention_heads=2, intermediate_size=24))
     old(features(), training=False)
     prefix = str(tmp_path / 'reference')
     old.save_weights(prefix)
@@ -36,6 +37,20 @@ def pair(tmp_path, candidate=False, mixed=False):
     old.return_cache = new.return_cache = True
     new.eval()
     return old, new, prefix, reference
+
+
+def test_checkpoint_conversion_cli(tmp_path):
+    _, original, prefix, _ = pair(tmp_path)
+    destination = tmp_path / 'converted.pt'
+    result = subprocess.run([
+        sys.executable, '-m', 'circuit_transformer.convert_checkpoint', prefix + '.index',
+        str(destination), '--num-inputs', '2', '--embedding-width', '64',
+        '--num-layers', '2', '--num-attention-heads', '2', '--intermediate-size', '24',
+    ], check=True, capture_output=True, text=True, timeout=30)
+    assert 'Converted all' in result.stdout
+    restored = small_circuit(ckpt_path=destination)._transformer
+    for name, value in original.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name], value, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize('candidate', [False, True])
@@ -87,7 +102,9 @@ def test_logits_loss_cache_and_gradients(tmp_path, candidate, mixed):
             obj = obj[int(component)] if component.isdigit() else getattr(obj, component)
         index = next(i for i, variable in enumerate(old.trainable_variables) if variable is obj)
         gradient = tf.convert_to_tensor(tf_grads[index]).numpy()
-        np.testing.assert_allclose(dict(new.named_parameters())[pt_name].grad, transform(gradient),
+        actual_gradient = dict(new.named_parameters())[pt_name].grad
+        assert actual_gradient is not None
+        np.testing.assert_allclose(actual_gradient, transform(gradient),
                                    atol=tolerance, rtol=tolerance, err_msg=pt_name)
 
 
@@ -169,11 +186,11 @@ def test_end_to_end_same_decode_and_rewards(tmp_path, mcts):
     _, _, prefix, _ = pair(tmp_path)
     reference = load_reference_circuit()
     old = reference.CircuitTransformer(num_inputs=2, embedding_width=64, num_layers=2,
-        num_attention_heads=2, intermediate_size=24, max_tree_depth=32, max_seq_length=12,
-        mixed_precision=False, ckpt_path=prefix)
+                                       num_attention_heads=2, intermediate_size=24, max_tree_depth=32, max_seq_length=12,
+                                       mixed_precision=False, ckpt_path=prefix)
     new = small_circuit(ckpt_path=prefix)
-    options = dict(max_inference_seq_length=12, num_mcts_steps=mcts,
-                   num_leaf_parallelization=2, num_mcts_playouts_per_step=2, return_envs=True)
+    options = SearchOptions(max_inference_seq_length=12, num_mcts_steps=mcts,
+                            num_leaf_parallelization=2, num_mcts_playouts_per_step=2, return_envs=True)
     aigs = [aig_pair(), aig_pair()]
     before = old.optimize_batch(aigs, **options)
     after = new.optimize_batch(aigs, **options)

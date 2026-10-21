@@ -8,22 +8,39 @@
 from __future__ import annotations
 
 import copy
-import json
+import json as json  # Legacy public utility exports.
 import typing
 import npn
 import numpy as np
 import os
 import graphviz
 import tempfile
-import itertools
+import itertools as itertools
 import time
 import platform
 import subprocess
-import uuid
-import pickle
+import shutil
+import uuid as uuid
+import pickle as pickle
 import multiprocessing
+import queue
+from functools import partial
 import bitarray
 import bitarray.util
+
+__all__ = [
+    'copy', 'json', 'typing', 'npn', 'np', 'os', 'graphviz', 'tempfile',
+    'itertools', 'time', 'platform', 'subprocess', 'uuid', 'pickle',
+    'multiprocessing', 'bitarray', 'base_path', 'abc_path', 'aigtoaig_path',
+    'temp_dir', 'temp_dir_init', 'Node', 'NodeWithInv', 'plot_network',
+    'compute_input_tt', 'compute_tt', 'compute_tts', 'check_conflict',
+    'sequential_synthesis', 'structural_hashing', 'cec', 'read_aiger',
+    'write_aiger', 'get_aig_info', 'npn_transform', 'npn_transform_tt',
+    'tt_to_str', 'count_num_ands', 'count_seq_length', 'check_integrity',
+    'base_2_log', 'get_inputs_rec', 'popcount', 'reverse_permutation',
+    'NPNP_transformation', 'detect_circle', 'get_subcircuit_nodes',
+    'aag_to_aig', 'divide_chunks', 'gpu_count', 'MPDataset', 'LogWrapper',
+]
 
 
 base_path = os.path.abspath(os.path.dirname(__file__))
@@ -41,11 +58,19 @@ def temp_dir_init():
 
 
 class Node:
-    def __init__(self, var, left, right):
+    def __init__(self, var: int | None, left: NodeWithInv | None, right: NodeWithInv | None):
         self.var = var      # var >= 0: x_{var}; var = -1: constant 0; var = -2: all possibilities of input nodes (x_0, not(x_0), x_1, not(x_1), ...)
         self.left = left
         self.right = right
-        self.input_symbol = None
+        self._input_symbol: str | None = None
+
+    @property
+    def input_symbol(self) -> str | None:
+        return self._input_symbol
+
+    @input_symbol.setter
+    def input_symbol(self, value: str | None):
+        self._input_symbol = value
 
     def is_leaf(self):
         return self.var is not None
@@ -102,9 +127,9 @@ class NodeWithInv(Node):
         self._parent.input_symbol = value
 
 
-def plot_network(roots: NodeWithInv | Node | list[NodeWithInv | Node], view=False, tree=False, filename: str = None,
-                 title: str = None, show_address=False, highlight_nodes: set = None):
-    def plot_network_rec(node: NodeWithInv, parent: NodeWithInv | None, depth: int, g: graphviz.Digraph, plotted_nodes: set):
+def plot_network(roots: NodeWithInv | Node | list[NodeWithInv | Node], view=False, tree=False, filename: str | None = None,
+                 title: str | None = None, show_address=False, highlight_nodes: set | None = None):
+    def plot_network_rec(node: NodeWithInv | None, parent: NodeWithInv | None, depth: int, g: graphviz.Digraph, plotted_nodes: set):
         # name = "x_%d" % node.var if node.var is not None else repr(node)
         if node is None:
             return
@@ -113,7 +138,7 @@ def plot_network(roots: NodeWithInv | Node | list[NodeWithInv | Node], view=Fals
             node.parent = copy.copy(node.parent)    # Node
             new_nodes.append(node)  # save the node instance so that it won't be destroyed (to avoid id reallocation)
         name = str(id(node.parent))
-        if node.is_leaf():
+        if node.var is not None:
             g.attr('node', color='lightyellow' if highlight_nodes is None or node.parent not in highlight_nodes else 'yellow')
             g.node(name, (("x_%d" % node.var) if node.var >= 0 else "0" if node.var == -1 else "not determined") + ("\n" + hex(id(node.parent)) if show_address else ""))
             g.attr('node', color='lightgrey')
@@ -138,13 +163,13 @@ def plot_network(roots: NodeWithInv | Node | list[NodeWithInv | Node], view=Fals
     g.attr('node', style='filled')
     if not isinstance(roots, list):
         roots = [roots]
-    roots = [NodeWithInv(root, inverted=False) if type(root) is Node else root for root in roots]
+    output_roots = [root if isinstance(root, NodeWithInv) else NodeWithInv(root, inverted=False) for root in roots]
     plotted_nodes = set()
     g.attr('node', color='lightgrey')
-    for root in roots:
+    for root in output_roots:
         plot_network_rec(root, None, 0, g, plotted_nodes)
     g.attr('node', color='lightblue')
-    for i, root in enumerate(roots):
+    for i, root in enumerate(output_roots):
         name = str(id(root.parent)) + str(root.inverted)
         g.node(name, "o_%d" % i)
         if root.inverted:
@@ -168,16 +193,25 @@ def compute_input_tt(num_inputs):
 
 
 def compute_tt(root: NodeWithInv | Node, num_inputs=None, input_tt=None, cache=None):
-    def compute_tt_rec(root: NodeWithInv) -> bitarray.bitarray:
+    if input_tt is None:
+        if num_inputs is None:
+            raise ValueError('Provide num_inputs or input_tt.')
+        input_tt = compute_input_tt(num_inputs)
+    elif num_inputs is None:
+        num_inputs = base_2_log(len(input_tt[0]))
+    truth_tables = input_tt
+    table_size = 2 ** num_inputs
+
+    def compute_tt_rec(root: NodeWithInv | None) -> bitarray.bitarray:
         if isinstance(cache, dict) and root in cache:
             return cache[root]
         if root is None:
             raise ValueError('root is None')
-        elif root.is_leaf():
+        elif root.var is not None:
             if root.var >= 0:
-                res = input_tt[root.var * 2]
+                res = truth_tables[root.var * 2]
             elif root.var == -1:    # -1 means constant zero
-                res = bitarray.util.zeros(2 ** num_inputs)
+                res = bitarray.util.zeros(table_size)
             else:                   # -2 means not decided
                 raise ValueError('root.value = %d, not supported' % root.var)
         elif isinstance(cache, dict) and root.parent in cache:
@@ -190,18 +224,14 @@ def compute_tt(root: NodeWithInv | Node, num_inputs=None, input_tt=None, cache=N
             res = ~res
         return res
 
-    if input_tt is None:
-        assert num_inputs is not None
-        input_tt = compute_input_tt(num_inputs)
-    elif num_inputs is None:
-        num_inputs = base_2_log(len(input_tt[0]))
-    if type(root) is Node:
-        root = NodeWithInv(root, inverted=False)
-    res = compute_tt_rec(root)
+    wrapped_root = root if isinstance(root, NodeWithInv) else NodeWithInv(root, inverted=False)
+    res = compute_tt_rec(wrapped_root)
     return res
 
 
-def compute_tts(roots: list[NodeWithInv], num_inputs=None, input_tt=None):
+def compute_tts(roots: NodeWithInv | list[NodeWithInv], num_inputs=None, input_tt=None):
+    if isinstance(roots, NodeWithInv):
+        roots = [roots]
     if input_tt is None:
         assert num_inputs is not None
         input_tt = compute_input_tt(num_inputs)
@@ -229,91 +259,67 @@ def check_conflict(tree_stack: list[NodeWithInv], tt, input_tt, cache):
     return has_conflict, completeness
 
 
+def _synthesize(roots, command, verbose=False):
+    commands = {
+        'resyn2': 'read input.aig; resyn2; write result.aig;',
+        'deepsyn': '&read input.aig; &deepsyn; &write -n result.aig;',
+        'transtoch': '&read input.aig; &transtoch -M 1 -V 0; &write -n result.aig;',
+        'strash': 'read input.aig; strash; write result.aig;',
+    }
+    if command not in commands:
+        raise ValueError(f'Unsupported synthesis command: {command}')
+    # Fixed filenames in a private working directory avoid shell quoting errors
+    # and collisions between concurrent synthesis calls.
+    with tempfile.TemporaryDirectory(dir=temp_dir_init()) as directory:
+        shutil.copyfile(os.path.join(base_path, 'bin', 'abc.rc'),
+                        os.path.join(directory, 'abc.rc'))
+        write_aiger(roots, os.path.join(directory, 'input.aig'), with_symbol_table=False)
+        result = subprocess.run([abc_path, '-c' if verbose else '-q', commands[command]],
+                                cwd=directory, capture_output=not verbose, text=True, check=True)
+        output = os.path.join(directory, 'result.aig')
+        if not os.path.isfile(output):
+            raise RuntimeError(f'ABC did not produce a circuit: {result.stdout or ""} {result.stderr or ""}')
+        return read_aiger(output)
+
+
 def sequential_synthesis(roots, verbose=False, command='resyn2', title: str = "sequential"):
-    temp_dir = temp_dir_init()
-    sequential_filename = temp_dir + "/" + (title if title is not None else "")
-    raw_filename = sequential_filename + "_raw"
-    write_aiger(roots, raw_filename + ".aig", with_symbol_table=False)
-    if command == 'deepsyn':
-        while True:
-            os.system(("%s %s \"&read %s; &deepsyn; &write -n %s;\"" %
-                       (abc_path, "-c" if verbose else "-q", raw_filename + ".aig", sequential_filename + ".aig"))
-                      + (" > NUL" if platform.system() == 'Windows' else ""))   # > /dev/null
-            if os.path.exists(sequential_filename + ".aig"):
-                break
-            else:
-                time.sleep(0.1)
-    elif command == 'resyn2':
-        while True:
-            os.system(("%s %s \"read %s; resyn2; write %s;\"" %
-                      (abc_path, "-c" if verbose else "-q", raw_filename + ".aig", sequential_filename + ".aig"))
-                      + (" > NUL" if platform.system() == 'Windows' else ""))
-            if os.path.exists(sequential_filename + ".aig"):
-                break
-            else:
-                time.sleep(0.1)
-    elif command == 'transtoch':
-        while True:
-            os.system(("%s %s \"&read %s; &transtoch -M 1 -V 0; &write -n %s;\"" %
-                       (abc_path, "-c" if verbose else "-q", raw_filename + ".aig", sequential_filename + ".aig"))
-                      + (" > NUL" if platform.system() == 'Windows' else ""))   # > /dev/null
-            if os.path.exists(sequential_filename + ".aig"):
-                break
-            else:
-                time.sleep(0.1)
-    os.unlink(raw_filename + ".aag")
-    os.unlink(raw_filename + ".aig")
-    seq_roots = read_aiger(sequential_filename + ".aig")
-    os.unlink(sequential_filename + ".aag")
-    os.unlink(sequential_filename + ".aig")
-    return seq_roots
+    return _synthesize(roots, command, verbose)
 
 
 def structural_hashing(roots, verbose=False):
-    temp_dir = temp_dir_init()
-    hashing_filename = temp_dir + "/hashing"
-    raw_filename = hashing_filename + "_raw"
-    write_aiger(roots, raw_filename + ".aig", with_symbol_table=False)
-    os.system(("%s %s \"read %s; strash; write %s;\"" %
-              (abc_path, "-c" if verbose else "-q", raw_filename + ".aig", hashing_filename + ".aig"))
-              + (" > NUL" if platform.system() == 'Windows' else ""))
-    return read_aiger(hashing_filename + ".aig")
+    return _synthesize(roots, 'strash', verbose)
 
 
 def cec(roots_1, roots_2, verbose=0):
-    temp_dir = temp_dir_init()
-    if isinstance(roots_1, str):
-        cec_filename_1 = roots_1
-    else:
-        cec_filename_1 = temp_dir + "/cec_1.aig"
-        write_aiger(roots_1, cec_filename_1, with_symbol_table=False)
-    if isinstance(roots_2, str):
-        cec_filename_2 = roots_2
-    else:
-        cec_filename_2 = temp_dir + "/cec_2.aig"
-        write_aiger(roots_2, cec_filename_2, with_symbol_table=False)
-    res = subprocess.run([abc_path, "-c", "cec %s %s" % (cec_filename_1, cec_filename_2)], capture_output=True)
-    stdout = res.stdout.decode("utf-8")
-    equivalent = "Networks are equivalent" in stdout
-    if verbose > 0 or not equivalent:
-        print(stdout)
-    return equivalent
+    with tempfile.TemporaryDirectory(dir=temp_dir_init()) as directory:
+        for index, roots in enumerate((roots_1, roots_2)):
+            filename = os.path.join(directory, f'input{index}.aig')
+            if isinstance(roots, (str, os.PathLike)):
+                shutil.copyfile(roots, filename)
+            else:
+                write_aiger(roots, filename, with_symbol_table=False)
+        result = subprocess.run([abc_path, '-c', 'cec input0.aig input1.aig'],
+                                cwd=directory, capture_output=True, text=True, check=True)
+        stdout = result.stdout
+        equivalent = 'Networks are equivalent' in stdout
+        if not equivalent and 'Networks are NOT EQUIVALENT' not in stdout:
+            raise RuntimeError(f'ABC equivalence check failed: {stdout} {result.stderr}')
+        if verbose > 0 or not equivalent:
+            print(stdout)
+        return equivalent
 
 
-def read_aiger(filename=None, aiger_str: str = None) -> (list[NodeWithInv], dict):
+def read_aiger(filename=None, aiger_str: str | None = None) -> tuple[NodeWithInv | list[NodeWithInv], list[int]]:
     if filename is not None:
         filename_without_ext, file_ext = os.path.splitext(filename)
         if file_ext == '.aig':  # binary
-            while True:
-                os.system("%s %s.aig %s.aag" % (aigtoaig_path, filename_without_ext, filename_without_ext))
-                if os.path.exists(filename_without_ext + ".aag"):
-                    break
-                else:
-                    time.sleep(0.1)
+            subprocess.run([aigtoaig_path, os.fspath(filename), filename_without_ext + '.aag'], check=True)
         filename = filename_without_ext + ".aag"
         with open(filename) as f:
             aiger_str = f.read()
-    f = aiger_str.split("\n")
+    if aiger_str is None:
+        raise ValueError('Provide filename or aiger_str.')
+    f = aiger_str.splitlines()
     lineid = 0
     s = f[lineid]
     lineid += 1
@@ -357,8 +363,8 @@ def read_aiger(filename=None, aiger_str: str = None) -> (list[NodeWithInv], dict
         node_dict[var_index].var = None
         node_dict[var_index].left = left
         node_dict[var_index].right = right
-    while f[lineid] != 'c' and f[lineid] != '' and lineid < len(f):
-        id, symbol = f[lineid].split(' ')
+    while lineid < len(f) and f[lineid] not in ('c', ''):
+        id, symbol = f[lineid].split(' ', 1)
         ioro, id = id[0], int(id[1:])
         if ioro == 'i':
             node_dict[input_indices[id]].input_symbol = symbol
@@ -370,13 +376,20 @@ def read_aiger(filename=None, aiger_str: str = None) -> (list[NodeWithInv], dict
         output_nodes.append(NodeWithInv(node_dict[output_index], output_not,
                                         output_symbol_dict[i] if i in output_symbol_dict else None))
     if num_outputs == 1:    # boolean function
-        output_nodes = output_nodes[0]
+        return output_nodes[0], info
     return output_nodes, info
 
 
-def write_aiger(root: NodeWithInv | list[NodeWithInv], filename: str = None, with_symbol_table=True, num_inputs=None) -> str:
-    def write_aiger_inputs_rec(root: NodeWithInv, info: dict, visited_nodes: set):
-        if root.is_leaf():
+def write_aiger(root: NodeWithInv | list[NodeWithInv], filename: str | None = None, with_symbol_table=True, num_inputs=None) -> str:
+    def write_aiger_inputs_rec(root: NodeWithInv | None, info: dict, visited_nodes: set):
+        if root is None:
+            raise ValueError('Cannot serialize an incomplete circuit.')
+        if root.var is not None:
+            if root.var == -1:
+                info['node_to_id'][root.parent] = 0
+                return
+            if root.var < 0:
+                raise ValueError('Cannot serialize an undetermined input.')
             # root.id = root.var + 1  # id starts from 1
             info['node_to_id'][root.parent] = root.var + 1
             info['inputs'][root.var + 1] = root.input_symbol
@@ -386,7 +399,9 @@ def write_aiger(root: NodeWithInv | list[NodeWithInv], filename: str = None, wit
                 write_aiger_inputs_rec(root.right, info, visited_nodes)
                 visited_nodes.add(root)
 
-    def write_aiger_rec(root: NodeWithInv, info: dict):
+    def write_aiger_rec(root: NodeWithInv | None, info: dict):
+        if root is None:
+            raise ValueError('Cannot serialize an incomplete circuit.')
         if not root.is_leaf():
             if root.parent not in info['node_to_id']:
                 left_id, left_not = write_aiger_rec(root.left, info)
@@ -407,9 +422,9 @@ def write_aiger(root: NodeWithInv | list[NodeWithInv], filename: str = None, wit
     for r in root:
         write_aiger_inputs_rec(r, info, set())
     if num_inputs is None:
-        info['node_id'] = max(info['inputs'].keys()) + 1   # skip the input ids
+        info['node_id'] = max(info['inputs'].keys(), default=0) + 1   # skip the input ids
     else:
-        if max(info['inputs'].keys()) > num_inputs:
+        if max(info['inputs'].keys(), default=0) > num_inputs:
             print("Warning: num_inputs is smaller than the actual number of inputs, use the latter instead")
             num_inputs = max(info['inputs'].keys())
         info['node_id'] = num_inputs + 1    # input ids from 1 to num_inputs
@@ -446,12 +461,8 @@ def write_aiger(root: NodeWithInv | list[NodeWithInv], filename: str = None, wit
         with open(filename_without_ext + ".aag", 'w', newline='\n') as f:
             f.write(aiger_str)
         if file_ext == '.aig':     # binary
-            while True:
-                os.system("%s %s.aag %s.aig" % (aigtoaig_path, filename_without_ext, filename_without_ext))
-                if os.path.exists(filename_without_ext + ".aig"):
-                    break
-                else:
-                    time.sleep(0.1)
+            subprocess.run([aigtoaig_path, filename_without_ext + '.aag',
+                            filename_without_ext + '.aig'], check=True)
             # os.unlink(filename_without_ext + ".aag")
     return aiger_str
 
@@ -460,17 +471,21 @@ def get_aig_info(filename):
     if not os.path.exists(filename):
         return [-1, -1, -1, -1, -1]
     with open(filename, 'rb') as f:
-        s, c = "", ""
-        while c != '\n':
-            s += c
-            c = f.read(1).decode('ascii')
+        s = f.readline().decode('ascii')
+        if not s:
+            raise ValueError('Empty AIGER file.')
         info = list(map(int, s.split(' ')[1:]))
     return info
 
 
-def npn_transform(roots: NodeWithInv | list[NodeWithInv], phase, perm, output_invs: bool | list[bool]):
-    def n_transform(root: NodeWithInv, phase, perm, transformed_node: set, transformed_node_with_inv: set):
-        if root.is_leaf():
+def npn_transform(roots: NodeWithInv | list[NodeWithInv], phase, perm,
+                  output_invs: bool | list[bool] | np.ndarray):
+    def n_transform(root: NodeWithInv | None, phase, perm, transformed_node: set, transformed_node_with_inv: set):
+        if root is None:
+            raise ValueError('Cannot transform an incomplete circuit.')
+        if root.var is not None:
+            if root.var < 0:
+                return
             if root not in transformed_node_with_inv:
                 if phase[root.var]:
                     root.inverted = not root.inverted
@@ -509,7 +524,7 @@ def tt_to_str(tt, hex=False):
         return "".join("1" if i else "0" for i in tt)
 
 
-def count_num_ands(root: NodeWithInv | list | None, node_set: set = None):
+def count_num_ands(root: NodeWithInv | list | None, node_set: set | None = None):
     if node_set is None:
         node_set = set()
     if isinstance(root, list):
@@ -521,24 +536,26 @@ def count_num_ands(root: NodeWithInv | list | None, node_set: set = None):
         return count_num_ands(root.left, node_set) + count_num_ands(root.right, node_set) + 1
 
 
-def count_seq_length(root: NodeWithInv | list[NodeWithInv] | Node | list[Node],
+def count_seq_length(root: NodeWithInv | list[NodeWithInv] | Node | list[Node] | None,
                      maximum_length=None, cut=None, cumulative_length=0):
     if isinstance(root, list):
         for r in root:
             if type(r) is Node:
                 r = NodeWithInv(r, inverted=False)
             cumulative_length = count_seq_length(r, maximum_length, cut, cumulative_length)
-            if cumulative_length == -1 or cumulative_length > maximum_length:
+            if cumulative_length == -1 or (maximum_length is not None and cumulative_length > maximum_length):
                 return -1
         return cumulative_length
+    if root is not None and not isinstance(root, NodeWithInv):
+        root = NodeWithInv(root, inverted=False)
     if root is None or root.is_leaf() or (cut is not None and root.parent in cut):
         return cumulative_length + 1
     else:
         cumulative_length = count_seq_length(root.left, maximum_length, cut, cumulative_length)
-        if cumulative_length == -1 or cumulative_length > maximum_length:
+        if cumulative_length == -1 or (maximum_length is not None and cumulative_length > maximum_length):
             return -1
         cumulative_length = count_seq_length(root.right, maximum_length, cut, cumulative_length)
-        if cumulative_length == -1 or cumulative_length + 1 > maximum_length:
+        if cumulative_length == -1 or (maximum_length is not None and cumulative_length + 1 > maximum_length):
             return -1
         return cumulative_length + 1
 
@@ -566,7 +583,9 @@ def base_2_log(n: int):     # see src/misc/util/abc_global.h in abc
         return r
 
 
-def get_inputs_rec(node: NodeWithInv | list[NodeWithInv], visited=None, inputs_dict=None):
+def get_inputs_rec(node: NodeWithInv | list[NodeWithInv] | None, visited=None, inputs_dict=None):
+    if node is None:
+        raise ValueError('Cannot traverse an incomplete circuit.')
     if visited is None:
         visited = set()
     if inputs_dict is None:
@@ -630,7 +649,9 @@ def NPNP_transformation(nodes: list[NodeWithInv], npnp_info: list):
     return new_nodes
 
 
-def detect_circle(root: NodeWithInv | list[NodeWithInv], visiting=None, visited=None):
+def detect_circle(root: NodeWithInv | list[NodeWithInv] | None, visiting=None, visited=None):
+    if root is None:
+        return False
     if visiting is None or visited is None:
         visiting, visited = set(), set()
     if isinstance(root, list):
@@ -649,7 +670,9 @@ def detect_circle(root: NodeWithInv | list[NodeWithInv], visiting=None, visited=
 
 
 def get_subcircuit_nodes(inputs, outputs):
-    def get_subcircuit_nodes_rec(root: NodeWithInv, inputs, node_set):
+    def get_subcircuit_nodes_rec(root: NodeWithInv | None, inputs, node_set):
+        if root is None:
+            raise ValueError('Cannot traverse an incomplete circuit.')
         if root.parent not in node_set:
             node_set.add(root.parent)
             if not root.is_leaf() and root.parent not in inputs:
@@ -664,7 +687,7 @@ def get_subcircuit_nodes(inputs, outputs):
 
 
 def aag_to_aig(aag_path, aig_path):
-    os.system("%s %s %s" % (aigtoaig_path, aag_path, aig_path))
+    subprocess.run([aigtoaig_path, os.fspath(aag_path), os.fspath(aig_path)], check=True)
 
 
 # https://www.geeksforgeeks.org/break-list-chunks-size-n-python/
@@ -685,38 +708,50 @@ class MPDataset:
     def __init__(self,
                  data: list,
                  mapping_func: typing.Callable,
-                 kwargs: dict = None,
+                 kwargs: dict | None = None,
                  num_processes=4,
                  validation_split=0.1):
         self.train_data, self.validation_data = \
             data[: int(len(data) * (1 - validation_split))], data[int(len(data) * (1 - validation_split)):]
-        self.mapping_func = mapping_func if kwargs is None else lambda x: mapping_func(x, **kwargs)
+        if num_processes < 0 or not 0 <= validation_split < 1:
+            raise ValueError('Expected num_processes >= 0 and validation_split in [0, 1).')
+        self.mapping_func = mapping_func if kwargs is None else partial(mapping_func, **kwargs)
         self.num_processes = num_processes
         self.queue = multiprocessing.Queue()
+        self.stop_event = multiprocessing.Event()
         # self.pool = multiprocessing.Pool(num_processes)
         self.chunk_size = 128 * 8
         # self.mapped_data_dir = tempfile.mkdtemp()
         #
-        def run(num_processes, mapping_func, train_data, chunk_size, q):
+        def run(num_processes, mapping_func, train_data, chunk_size, q, stop_event):
             print("process start running")
-
-            pool = multiprocessing.Pool(num_processes)
-            chunk_id = 0
-            while True:
-                if q.qsize() < chunk_size:
-                    for mapped_data in pool.imap_unordered(mapping_func, train_data[chunk_id * chunk_size: (chunk_id + 1) * chunk_size], chunksize=128):
-                        if not isinstance(mapped_data, Exception):
-                            q.put(mapped_data)
-                    chunk_id += 1
-                    if chunk_id * chunk_size >= len(train_data):
-                        chunk_id = 0
-                else:
-                    time.sleep(0.1)
+            # Do not wait for queued prefetched batches to drain on shutdown.
+            q.cancel_join_thread()
+            with multiprocessing.Pool(num_processes) as pool:
+                chunk_id = 0
+                try:
+                    while train_data and not stop_event.is_set():
+                        if q.qsize() < chunk_size:
+                            chunk = train_data[chunk_id * chunk_size: (chunk_id + 1) * chunk_size]
+                            for mapped_data in pool.imap_unordered(mapping_func, chunk, chunksize=128):
+                                if isinstance(mapped_data, Exception):
+                                    raise mapped_data
+                                q.put(mapped_data)
+                            chunk_id += 1
+                            if chunk_id * chunk_size >= len(train_data):
+                                chunk_id = 0
+                        else:
+                            stop_event.wait(0.1)
+                except Exception as exc:
+                    q.put(RuntimeError(f'Dataset worker failed: {type(exc).__name__}: {exc}'))
+                    # Keep the queue alive until the consumer receives the error.
+                    stop_event.wait()
 
         if self.num_processes > 1:
             self.process = multiprocessing.Process(
                 target=run,
-                args=(num_processes, mapping_func, self.train_data, self.chunk_size, self.queue)
+                args=(num_processes, self.mapping_func, self.train_data, self.chunk_size,
+                      self.queue, self.stop_event)
             )
             self.process.start()
 
@@ -724,24 +759,38 @@ class MPDataset:
         return len(self.train_data)
 
     def train_generator(self):
-        counter = 0
         if self.num_processes > 1:
-            while True:
-                if not self.queue.empty():
-                    counter += 1
-                    if counter < len(self.train_data):
-                        yield self.queue.get()
-                    else:
+            # Preserve N-1 examples and queue carryover across epochs.
+            for _ in range(max(len(self.train_data) - 1, 0)):
+                while True:
+                    try:
+                        item = self.queue.get(timeout=0.1)
                         break
+                    except queue.Empty:
+                        if not self.process.is_alive():
+                            raise RuntimeError('Dataset producer exited before returning all examples.')
+                if isinstance(item, Exception):
+                    raise item
+                yield item
         else:
             for data in self.train_data:
                 yield self.mapping_func(data)
 
+    def close(self):
+        self.stop_event.set()
+        if self.num_processes > 1:
+            self.process.join(timeout=2)
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join()
+        self.queue.close()
+
     def validation_generator(self):
         for data in self.validation_data:
             mapped_data = self.mapping_func(data)
-            if not isinstance(mapped_data, Exception):
-                yield mapped_data
+            if isinstance(mapped_data, Exception):
+                raise mapped_data
+            yield mapped_data
 
     def benchmark(self, num_data=512):
         counter = 0

@@ -9,9 +9,7 @@ from __future__ import annotations
 
 import copy
 import os
-import pickle
-import types
-from collections import deque, Counter
+from typing import Any, TypeVar
 
 import bitarray
 import bitarray.util
@@ -20,22 +18,28 @@ import scipy.special as special
 import npn
 import time
 import json
-import sys
-import tracemalloc
 import torch
 from circuit_transformer.pytorch_transformer import Seq2SeqTransformer
-from circuit_transformer.utils import *
+from circuit_transformer.utils import (
+    Node, NodeWithInv, base_2_log, cec, check_conflict, check_integrity,
+    compute_input_tt, compute_tt, compute_tts, count_num_ands, detect_circle,
+    get_inputs_rec, npn_transform, read_aiger, sequential_synthesis,
+)
+
+_Env = TypeVar('_Env', 'LogicNetworkEnv', list['LogicNetworkEnv'])
 
 
 def node_to_int(root: NodeWithInv, num_inputs: int):
     # zero for [PAD] that will be masked
-    if root.is_leaf():
+    if root.var is not None:
         return 2 + root.var * 2 + root.inverted  # [x_i] or [x_i_NOT]
     else:
         return 2 + num_inputs * 2 + root.inverted  # [AND] or [AND_NOT]
 
 
 def int_to_node(token: int, num_inputs: int):
+    if not 0 <= token < 2 + num_inputs * 2 + 2:
+        raise ValueError(token)
     if token == 0 or token == 1:  # [PAD] or [EOS]
         return False
     elif token < 2 + num_inputs * 2:  # [x_i] or [x_i_NOT]
@@ -46,8 +50,10 @@ def int_to_node(token: int, num_inputs: int):
         raise ValueError(token)
 
 
-def encode_aig(roots: list[NodeWithInv], num_inputs: int) -> (list[int], list[int]):
-    def encode_aig_rec(root: NodeWithInv, seq_enc: list[int], cur_pos_enc: int, pos_enc: list[int]):
+def encode_aig(roots: list[NodeWithInv], num_inputs: int) -> tuple[list[int], list[int]]:
+    def encode_aig_rec(root: NodeWithInv | None, seq_enc: list[int], cur_pos_enc: int, pos_enc: list[int]):
+        if root is None:
+            raise ValueError('Cannot encode an incomplete circuit.')
         seq_enc.append(node_to_int(root, num_inputs))
         pos_enc.append(cur_pos_enc)
         if not root.is_leaf():
@@ -55,7 +61,8 @@ def encode_aig(roots: list[NodeWithInv], num_inputs: int) -> (list[int], list[in
             encode_aig_rec(root.right, seq_enc, (cur_pos_enc << 2) + 2, pos_enc)
 
     seq_enc, pos_enc = [], []
-    assert len(roots) <= 2
+    if not 1 <= len(roots) <= 2:
+        raise ValueError('A circuit must have one or two outputs.')
     encode_aig_rec(roots[0], seq_enc, 1, pos_enc)
     if len(roots) == 2:
         encode_aig_rec(roots[1], seq_enc, 2, pos_enc)
@@ -87,6 +94,8 @@ def deref_node(root: Node, ref_dict: dict, context_nodes=None, verbose=0):
     if root.is_leaf():
         return 0
     value = 1
+    if root.left is None or root.right is None:
+        raise ValueError('Cannot dereference an incomplete AND node.')
     for child in [root.left.parent, root.right.parent]:
         if verbose > 1:
             print("ref %s (parent %s, %s) from %d to %d" %
@@ -110,7 +119,7 @@ class LogicNetworkEnv:
                  max_length=None,
                  eos_id=1,
                  pad_id=0,
-                 context_hash: set = None,
+                 context_hash: set | None = None,
                  ffw = None,
                  and_always_available=False,    # for training
                  use_controllability_dont_cares=True,   # Patterns that cannot happen at inputs to a network node.
@@ -281,10 +290,12 @@ class LogicNetworkEnv:
         elif self.is_finished:
             assert token == self.PAD
             reward, done = 0, True
-        elif not self.is_finished and self.t >= self.max_length - 1:  # reached the last step but still not finished
+        elif self.max_length is not None and self.t >= self.max_length - 1:  # reached the last step but still not finished
             reward, done = self.unfinished_penalty, True
         else:
             node = int_to_node(token, self.num_inputs)
+            if node is False:
+                raise ValueError('PAD cannot be inserted into an unfinished circuit.')
             if len(self.tree_stack) == 0:
                 self.roots.append(node)
             else:
@@ -339,8 +350,8 @@ class LogicNetworkEnv:
                             self.tt_cache_bitarray_compressed[self.tree_stack[-1]] = self.compress(self.tt_cache_bitarray[self.tree_stack[-1]])
                         else:
                             tt_bitarray_compressed = compute_tt(self.tree_stack[-1],
-                                                                               input_tt=self.input_tt_bitarray_compressed,
-                                                                               cache=self.tt_cache_bitarray_compressed)
+                                                                input_tt=self.input_tt_bitarray_compressed,
+                                                                cache=self.tt_cache_bitarray_compressed)
                             self.tt_cache_bitarray_compressed[self.tree_stack[-1]] = tt_bitarray_compressed
                         if self.context_hash is not None and (tt in self.context_hash or tt_not in self.context_hash):
                             v1 = deref_node(self.tree_stack[-1].parent, self.ref_dict, self.context_nodes)
@@ -392,7 +403,7 @@ class LogicNetworkEnv:
                     else bitarray.bitarray('11')
 
             # remove the node from the tree
-            if not is_root:
+            if not is_root and cur_node is not None:
                 if cur_node.right is None:
                     cur_node.left = None
                 else:
@@ -405,7 +416,8 @@ class LogicNetworkEnv:
 class MCTSNode:
     INIT_MAX_VALUE = -1000
 
-    def __init__(self, parent, t, action, prob=None, info=None, puct_explore_ratio=1.):
+    def __init__(self, parent, t, action, prob: float | None = None,
+                 info: dict[str, Any] | None = None, puct_explore_ratio=1.):
         self.t = t
         self.parent = parent
         self.action = action
@@ -414,8 +426,9 @@ class MCTSNode:
         self.explored_children = 0
         self.visits = 0
         self.total_value = 0
-        self.info = info
-        self.v = None
+        self.info = {} if info is None else info
+        self.v: float | None = None
+        self.sum_reward = 0.
         self.prob = prob
         self.max_value = self.INIT_MAX_VALUE
         self.puct_explore_ratio = puct_explore_ratio
@@ -426,11 +439,14 @@ class MCTSNode:
 
     @property
     def puct(self):
+        if self.prob is None or self.parent is None:
+            raise ValueError('PUCT is only defined for a child with an action probability.')
         return self.value + self.puct_explore_ratio * self.prob * np.sqrt(self.parent.visits) / (1 + self.visits)
 
     def __repr__(self):     # sum reward: from the root to the end, value: future reward from (excluding) the current node to the end
         repr = "(%s%s, visits: %d, avg sum reward: %.2f, max sum reward: %d, value: %s, seq: %s)" % \
-               (self.action, " (Done)" if self.info['done'] else "", self.visits, self.value, self.max_value, self.v, self.info['env'].tokens)
+               (self.action, " (Done)" if self.info.get('done') else "", self.visits, self.value, self.max_value, self.v,
+                self.info['env'].tokens if 'env' in self.info else [])
         if self.prob is not None:
             repr = repr[:-1] + ", prob: %.2f, puct: %.2f)" % (self.prob, self.puct)
         return repr
@@ -460,6 +476,12 @@ class CircuitTransformer:
                  policy_temperature_in_mcts=1.,
                  device=None
                  ):
+        if num_inputs < 1 or max_seq_length < 1 or inference_batch_size < 1:
+            raise ValueError('num_inputs, max_seq_length, and inference_batch_size must be positive.')
+        if max_tree_depth < 1 or max_tree_depth & (max_tree_depth - 1):
+            raise ValueError('max_tree_depth must be a positive power of two.')
+        if policy_temperature_in_mcts <= 0:
+            raise ValueError('policy_temperature_in_mcts must be positive.')
         self.num_inputs = num_inputs
         self.vocab_size = 2 + 2 * self.num_inputs + 2
         self.embedding_width = embedding_width
@@ -475,6 +497,8 @@ class CircuitTransformer:
         self.ckpt_path = ckpt_path
         self.add_action_mask_to_input = add_action_mask_to_input
         self.policy_temperature_in_mcts = policy_temperature_in_mcts
+        self.training_history: list[dict[str, float]] = []
+        self._weights_ready = False
 
         self.device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
         self.mixed_precision = mixed_precision
@@ -498,23 +522,21 @@ class CircuitTransformer:
     @torch.inference_mode()
     def _transformer_inference(self, inputs, return_kv_cache=False, return_last_token=False):
         self._transformer.eval()
+        if return_kv_cache and not self.use_kv_cache and inputs.get('cache'):
+            inputs = dict(inputs)
+            inputs['cache'] = dict(inputs['cache'], kv_cache=None)
         policy, cache = self._transformer(inputs, return_kv_cache=return_kv_cache,
-                                           return_last_token=return_last_token)
+                                          return_last_token=return_last_token)
         return policy.cpu().numpy(), cache
 
-    def _copy_env(self, env: LogicNetworkEnv | list[LogicNetworkEnv]):
+    def _copy_env(self, env: _Env) -> _Env:
         if isinstance(env, list):
             return [self._copy_env(e) for e in env]
         else:
-            context_hash, tts_bitarray, input_tt_bitarray, input_tt_bitarray_compressed, ffw = \
-                env.context_hash, env.tts_bitarray, env.input_tt_bitarray, env.input_tt_bitarray_compressed, env.ffw
-            env.context_hash, env.tts, env.input_tt, env.input_tt_bitarray_compressed, env.ffw = None, None, None, None, None
-            res = copy.deepcopy(env)
-            env.context_hash, env.tts_bitarray, env.input_tt_bitarray, env.input_tt_bitarray_compressed, env.ffw = \
-                context_hash, tts_bitarray, input_tt_bitarray, input_tt_bitarray_compressed, ffw
-            res.context_hash, res.tts_bitarray, res.input_tt_bitarray, res.input_tt_bitarray_compressed, res.ffw = \
-                context_hash, tts_bitarray, input_tt_bitarray, input_tt_bitarray_compressed, ffw
-            return res
+            # Share fixed search inputs without temporarily mutating the source.
+            shared = (env.context_hash, env.tts_bitarray, env.input_tt_bitarray,
+                      env.input_tt_bitarray_compressed, env.ffw)
+            return copy.deepcopy(env, {id(value): value for value in shared if value is not None})
 
     def _batch_estimate_policy(self, envs: list[LogicNetworkEnv], src_tokens, src_pos_enc, src_action_mask, action_masks, cache):
         start_time = time.time()
@@ -526,13 +548,13 @@ class CircuitTransformer:
         tgt_pos_enc = np.stack(
             [np.stack(
                 env.positional_encodings + [np.zeros(self.max_tree_depth * 2, dtype=np.float32)] * (
-                        max_token_length - len(env.tokens)),
+                    max_token_length - len(env.tokens)),
                 axis=0) for env in envs]
             , axis=0)
         tgt_action_mask = np.stack(
             [np.concatenate([np.stack(env.action_masks),
                             np.ones((max_token_length - len(env.action_masks), self.vocab_size), dtype=bool)], axis=0)
-            for env in envs]
+             for env in envs]
         )
         inputs = {'inputs': src_tokens, 'enc_pos_encoding': src_pos_enc,
                   'targets': tgt_tokens, 'dec_pos_encoding': tgt_pos_enc,
@@ -547,6 +569,8 @@ class CircuitTransformer:
 
     def _batch_estimate_v_value_via_simulation_kvcache(self, envs: list[LogicNetworkEnv], src_tokens, src_pos_enc, src_action_mask,
                                                        max_inference_seq_length, cache=None, num_leaf_parallelization=1):
+        if max_inference_seq_length < 1 or num_leaf_parallelization < 1:
+            raise ValueError('Decode length and leaf parallelization must be positive.')
         total_time = time.time()
         envs = self._copy_env(envs)
         copy_time = time.time() - total_time
@@ -560,6 +584,7 @@ class CircuitTransformer:
         transformer_time = 0.
         action_mask_time = 0.
         step_time = 0.
+        i = -1
         for i in range(max_inference_seq_length):
             # print(i)
             inputs['targets'], inputs['dec_pos_encoding'] = targets, dec_pos_encoding
@@ -570,6 +595,8 @@ class CircuitTransformer:
             action_masks = [e.action_masks[i] for e in envs]# [e.gen_action_mask() if i == e.t else np.ones(self.vocab_size, dtype=bool) for e in envs]
             action_masks = np.stack(action_masks, axis=0)
             inputs['dec_action_mask'] = np.expand_dims(action_masks, axis=1)
+            if not self.use_kv_cache:
+                inputs['dec_action_mask'] = np.stack([e.action_masks[:targets.shape[1]] for e in envs])
             action_mask_time += time.time() - start_time
 
             start_time = time.time()
@@ -609,9 +636,14 @@ class CircuitTransformer:
         return v.tolist(), [e.success for e in envs], cache
 
     def _batch_MCTS_policy_with_leaf_parallelization(self, envs: list[LogicNetworkEnv], num_leaf_parallelizations=8, num_playouts=100, max_inference_seq_length=None,
-                           src_tokens=None, src_pos_enc=None, src_action_mask=None,
-                           roots=None, orig_aigs_size=None, puct_explore_ratio=1.):
+                                                     src_tokens=None, src_pos_enc=None, src_action_mask=None,
+                                                     roots=None, orig_aigs_size=None, puct_explore_ratio=1.):
+        if num_leaf_parallelizations < 1 or num_playouts < 1:
+            raise ValueError('MCTS leaf parallelization and playouts must be positive.')
+        if src_tokens is None or src_pos_enc is None or src_action_mask is None:
+            raise ValueError('MCTS requires source tokens, positions, and action masks.')
         def update_done_node(node: MCTSNode, root_id):
+            assert roots is not None
             if node is not roots[root_id]:  # update done info to avoid unnecessary search
                 done_node = node.parent
                 while np.all([c.info['done'] and c.explored for c in done_node.children]):
@@ -760,6 +792,7 @@ class CircuitTransformer:
 
                 for largest_node, node in largest_node_list[l]:
                     largest_node.explored = True  # so #(explored nodes) >= num_rollouts
+                    assert node.v is not None
                     largest_node.v = node.v - largest_node.info['reward']
                     largest_node.max_value = node.max_value
                     largest_node.sum_reward = node.sum_reward
@@ -798,14 +831,14 @@ class CircuitTransformer:
         if self.verbose > 0 and len(seq_enc) > self.max_seq_length:
             print("Warning: seq_enc length %d > max seq length (%d)" % (len(seq_enc), self.max_seq_length))
         seq_enc, pos_enc = seq_enc[:self.max_seq_length], pos_enc[:self.max_seq_length]
-        pos_enc = np.stack(
+        pos_array = np.stack(
             [list(reversed(npn.int_to_tt(pos_enc_i, base_2_log(self.max_tree_depth) + 1))) for pos_enc_i in pos_enc],
             axis=0)  # 2 ^ 6 = 64 == max_tree_depth * 2
-        seq_enc = np.array(seq_enc + [0] * (self.max_seq_length - len(seq_enc)), dtype=np.int32)
-        pos_enc = np.concatenate([pos_enc, np.zeros((self.max_seq_length - len(pos_enc), self.max_tree_depth * 2))],
-                                 axis=0,
-                                 dtype=np.float32)
-        return seq_enc, pos_enc
+        seq_array = np.array(seq_enc + [0] * (self.max_seq_length - len(seq_enc)), dtype=np.int32)
+        pos_array = np.concatenate([pos_array, np.zeros((self.max_seq_length - len(pos_array), self.max_tree_depth * 2))],
+                                   axis=0,
+                                   dtype=np.float32)
+        return seq_array, pos_array
 
     def save(self, ckpt_path):
         from circuit_transformer.checkpoints import save_checkpoint
@@ -869,6 +902,8 @@ class CircuitTransformer:
         output_invs = np.random.rand(num_outputs) < 0.5
         roots = npn_transform(roots, phase, perm, output_invs)
         opt_roots = npn_transform(opt_roots, phase, perm, output_invs)
+        roots = roots if isinstance(roots, list) else [roots]
+        opt_roots = opt_roots if isinstance(opt_roots, list) else [opt_roots]
 
         seq_enc, pos_enc = self._encode_postprocess(*encode_aig(roots, num_inputs))
         opt_seq_enc, opt_pos_enc = encode_aig(opt_roots, num_inputs)
@@ -902,7 +937,7 @@ class CircuitTransformer:
     def optimize(self,
                  aigs: list,
                  context_num_inputs=None,
-                 input_tts: list = None,
+                 input_tts: list | None = None,
                  care_set_tts=None,
                  ffws=None,
                  context_hash_list=None,
@@ -917,7 +952,9 @@ class CircuitTransformer:
                  overflow_option='origin',
                  return_envs=False,
                  ):
-        if self.ckpt_path is None:
+        if not aigs:
+            return []
+        if self.ckpt_path is None and not self._weights_ready:
             print("no checkpoint loaded, downloading from https://huggingface.co/snowkylin/circuit-transformer ...")
             self.load_from_hf()
 
@@ -958,7 +995,7 @@ class CircuitTransformer:
                        max_inference_seq_length,
                        max_mcts_inference_seq_length=None,
                        context_num_inputs=None,
-                       input_tts: list = None,
+                       input_tts: list | None = None,
                        care_set_tts=None,
                        ffws=None,
                        context_hash_list=None,
@@ -974,6 +1011,14 @@ class CircuitTransformer:
                        return_input_encodings=False,
                        puct_explore_ratio=1.
                        ):
+        if not aigs:
+            raise ValueError('optimize_batch requires at least one circuit.')
+        if max_inference_seq_length < 1:
+            raise ValueError('max_inference_seq_length must be positive.')
+        if num_mcts_steps < 0:
+            raise ValueError('num_mcts_steps must be nonnegative.')
+        if num_mcts_steps and (num_leaf_parallelization < 1 or num_mcts_playouts_per_step < 1):
+            raise ValueError('MCTS leaf parallelization and playouts must be positive.')
         total_time = time.time()
         start_time = time.time()
         encoded_aigs = []
@@ -985,8 +1030,10 @@ class CircuitTransformer:
         orig_aig_size = []
         for i, aig in enumerate(aigs):
             if isinstance(aig, str):
-                aigs[i], info = read_aiger(aig)
-            if len(aigs[i]) > 2:
+                aig, _ = read_aiger(aig)
+            aig = aig if isinstance(aig, list) else [aig]
+            aigs[i] = aig
+            if len(aig) > 2:
                 raise OverflowError("the number of outputs for input aig network should be <= 2 "
                                     "as the default model is trained on 8-input, 2-output networks")
             orig_aig_size.append(count_num_ands(aigs[i]))
@@ -1026,6 +1073,8 @@ class CircuitTransformer:
             verbose=self.verbose)
             for i, aig in enumerate(aigs)]
         init_mcts_roots = [MCTSNode(None, 0, None, info={'env': env, 'reward': None, 'done': None, 'rollout_success': None}, puct_explore_ratio=puct_explore_ratio) for env in self._copy_env(envs)]
+        mcts_roots = init_mcts_roots
+        best_token_seqs = [[] for _ in envs]
         transformer_time = 0.
         action_mask_time = 0.
         step_time = 0.
@@ -1041,6 +1090,8 @@ class CircuitTransformer:
             start_time = time.time()
             action_masks = np.stack([e.action_masks[i] for e in envs], axis=0)
             inputs['dec_action_mask'] = np.expand_dims(action_masks, axis=1)
+            if not self.use_kv_cache:
+                inputs['dec_action_mask'] = np.stack([e.action_masks[:targets.shape[1]] for e in envs])
             action_mask_time += time.time() - start_time
 
             start_time = time.time()
@@ -1054,15 +1105,15 @@ class CircuitTransformer:
             if num_mcts_steps > 0:
                 if i < num_mcts_steps:
                     best_token_seqs, mcts_roots = self._batch_MCTS_policy_with_leaf_parallelization(envs,
-                                                                          max_inference_seq_length=max_mcts_inference_seq_length,
-                                                                          num_leaf_parallelizations=num_leaf_parallelization,
-                                                                          num_playouts=num_mcts_playouts_per_step,
-                                                                          src_tokens=seq_enc,
-                                                                          src_pos_enc=pos_enc,
-                                                                          src_action_mask=enc_action_masks,
-                                                                          roots=init_mcts_roots if i == 0 else mcts_roots,
-                                                                          orig_aigs_size=orig_aig_size,
-                                                                          puct_explore_ratio=puct_explore_ratio)
+                                                                                                    max_inference_seq_length=max_mcts_inference_seq_length,
+                                                                                                    num_leaf_parallelizations=num_leaf_parallelization,
+                                                                                                    num_playouts=num_mcts_playouts_per_step,
+                                                                                                    src_tokens=seq_enc,
+                                                                                                    src_pos_enc=pos_enc,
+                                                                                                    src_action_mask=enc_action_masks,
+                                                                                                    roots=init_mcts_roots if i == 0 else mcts_roots,
+                                                                                                    orig_aigs_size=orig_aig_size,
+                                                                                                    puct_explore_ratio=puct_explore_ratio)
                     tokens = [b[0] for b in best_token_seqs]
                 else:
                     if i == num_mcts_steps:
@@ -1087,16 +1138,18 @@ class CircuitTransformer:
             step_time += time.time() - start_time
             if self.verbose > 0:
                 print(i, tokens)
-        if return_envs and self.verbose == 0:
+        if return_envs and self.verbose == 0 and not return_mcts_roots and not return_input_encodings:
             return envs
         optimized_aigs = []
         num_succeed_aigs = 0
         total_gain, seq_total_gain_for_succeeded_aig, seq_total_gain = 0, 0, 0
         for i, (aig, env) in enumerate(zip(aigs, envs)):
             orig_num_ands = count_num_ands(aig)
+            synthesized_num_ands = orig_num_ands
             if self.verbose > 1:
                 seq_roots, info = sequential_synthesis(aig)
-                seq_total_gain += orig_num_ands - info[4]
+                synthesized_num_ands = info[4]
+                seq_total_gain += orig_num_ands - synthesized_num_ands
             assert env.success == (len(env.roots) == len(aig) and check_integrity(env.roots))
             if env.success:
                 num_succeed_aigs += 1
@@ -1106,17 +1159,17 @@ class CircuitTransformer:
                     num_ands = count_num_ands(env.roots)
                     total_gain += max(orig_num_ands - num_ands, 0)
                     print("aig #%d successfully optimized, #(AND) from %d to %d, cumulative reward %d, gain = %d" %
-                          (i, orig_num_ands, num_ands, env.cumulative_reward, orig_num_ands - num_ands),
-                          end="" if self.verbose > 1 else "\n")
+                            (i, orig_num_ands, num_ands, env.cumulative_reward, orig_num_ands - num_ands),
+                            end="" if self.verbose > 1 else "\n")
                     if self.verbose > 1:
-                        seq_total_gain_for_succeeded_aig += orig_num_ands - info[4]
-                        print(" (resyn2: %d)" % info[4])
+                        seq_total_gain_for_succeeded_aig += orig_num_ands - synthesized_num_ands
+                        print(" (resyn2: %d)" % synthesized_num_ands)
             else:
                 if self.verbose > 0:
                     print("aig #%d (#(AND) = %d) failed to be optimized%s" %
-                          (i, orig_num_ands, ', use original aig instead' if overflow_option == 'origin' else ''))
+                            (i, orig_num_ands, ', use original aig instead' if overflow_option == 'origin' else ''))
                     if self.verbose > 1:
-                        print(" (resyn2: %d)" % info[4])
+                        print(" (resyn2: %d)" % synthesized_num_ands)
                 if not return_envs:
                     optimized_aigs.append(aig if overflow_option == 'origin' else env.roots)
         if self.verbose > 0:
@@ -1130,7 +1183,7 @@ class CircuitTransformer:
                 if num_succeed_aigs > 0:
                     print("resyn2: %.3f / %.3f" % (
                         seq_total_gain_for_succeeded_aig / num_succeed_aigs, seq_total_gain / len(aigs)))
-        if not return_envs and not return_mcts_roots:
+        if not return_envs and not return_mcts_roots and not return_input_encodings:
             return optimized_aigs
         ret = []
         if return_envs:

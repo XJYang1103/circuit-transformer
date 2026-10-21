@@ -17,10 +17,15 @@ original uses pre-norm, biased feed-forward layers, bias-free attention, an
 extra final normalization, and tied decoder embedding/output weights.
 """
 import math
+from collections.abc import Callable
+from typing import TypeVar, overload
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+
+_Loss = TypeVar('_Loss', float, torch.Tensor)
 
 
 class TreePositionEncodingPostProcessing(nn.Module):
@@ -40,20 +45,26 @@ class TreePositionEncodingPostProcessing(nn.Module):
 
 
 class Float32LayerNorm(nn.LayerNorm):
-    def forward(self, x):
+    def forward(self, input):
         # TF Models explicitly sets layer normalization dtype to float32.
-        return F.layer_norm(x.float(), self.normalized_shape,
-                            self.weight.float(), self.bias.float(), self.eps)
+        return F.layer_norm(input.float(), self.normalized_shape,
+                            None if self.weight is None else self.weight.float(),
+                            None if self.bias is None else self.bias.float(), self.eps)
 
 
 class Attention(nn.Module):
     def __init__(self, width, heads):
         super().__init__()
         self.heads, self.head_dim = heads, width // heads
-        for name in ('query', 'key', 'value', 'output'):
+        def projection():
             layer = nn.Linear(width, width, bias=False)
             nn.init.uniform_(layer.weight, -math.sqrt(3 / width), math.sqrt(3 / width))
-            setattr(self, name, layer)
+            return layer
+
+        self.query = projection()
+        self.key = projection()
+        self.value = projection()
+        self.output = projection()
 
     def forward(self, query, memory, mask, cache=None, dtype=torch.float32):
         def project(layer, x):
@@ -123,7 +134,7 @@ class TransformerStack(nn.Module):
 class Seq2SeqTransformer(nn.Module):
     def __init__(self, enc_vocab_size=20, dec_vocab_size=20, embedding_width=512,
                  num_layers=12, num_attention_heads=8, intermediate_size=2048,
-                 dropout_rate=0.0, max_tree_depth=32,
+                 dropout_rate=0.0, max_tree_depth: int | None = 32,
                  add_action_mask_to_inputs=False, eos_id=1, mixed_precision=False,
                  padded_decode=False, decode_max_length=None, extra_decode_length=0,
                  beam_size=4, alpha=0.6,
@@ -131,6 +142,22 @@ class Seq2SeqTransformer(nn.Module):
         super().__init__()
         if kwargs:
             raise TypeError('Unsupported Transformer options: ' + ', '.join(kwargs))
+        for name, value in (('embedding_width', embedding_width), ('num_layers', num_layers),
+                            ('num_attention_heads', num_attention_heads),
+                            ('intermediate_size', intermediate_size), ('enc_vocab_size', enc_vocab_size),
+                            ('dec_vocab_size', dec_vocab_size), ('beam_size', beam_size)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f'{name} must be a positive integer')
+        if not 0 <= eos_id < dec_vocab_size:
+            raise ValueError('eos_id must be in the decoder vocabulary')
+        if max_tree_depth is not None and max_tree_depth < 1:
+            raise ValueError('max_tree_depth must be positive or None')
+        if not 0 <= dropout_rate <= 1:
+            raise ValueError('dropout_rate must be in [0, 1]')
+        if decode_max_length is not None and decode_max_length < 1:
+            raise ValueError('decode_max_length must be positive')
+        if extra_decode_length < 0:
+            raise ValueError('extra_decode_length must be nonnegative')
         if embedding_width % num_attention_heads:
             raise ValueError('embedding_width must be divisible by num_attention_heads')
         if max_tree_depth is not None and embedding_width % (max_tree_depth * 2):
@@ -179,11 +206,11 @@ class Seq2SeqTransformer(nn.Module):
             return (self.tree_position_embedding(result)
                     if self.tree_position_embedding is not None else result)
         # TF RelativePositionEmbedding concatenates sin and cos halves.
-        n = self.width // 2
+        n = (self.width + 1) // 2
         inv = torch.exp(torch.arange(n, device=self.enc_embedding_lookup.weight.device,
-                                     dtype=torch.float32) * -(math.log(10000) / (n - 1)))
+                                     dtype=torch.float32) * -(math.log(10000) / max(n - 1, 1)))
         angles = torch.arange(length, device=inv.device)[:, None] * inv[None]
-        return torch.cat((angles.sin(), angles.cos()), dim=-1)[None].to(self.compute_dtype)
+        return torch.cat((angles.sin(), angles.cos()), dim=-1)[None, :, :self.width].to(self.compute_dtype)
 
     def _embed(self, tokens, layer):
         return F.embedding(tokens.long(), layer.weight.to(self.compute_dtype)) * math.sqrt(self.width)
@@ -191,7 +218,7 @@ class Seq2SeqTransformer(nn.Module):
     def _candidates(self, mask, layer, ratio):
         values = self._tensor(mask, self.compute_dtype)
         return ratio.to(self.compute_dtype) * (
-            values @ layer.weight.to(self.compute_dtype) / values.sum(-1, keepdim=True))
+            values @ layer.weight.to(self.compute_dtype) / values.sum(-1, keepdim=True).clamp_min(1))
 
     def forward(self, inputs, training=None, mask=None, return_kv_cache=False,
                 return_last_token=False):
@@ -216,7 +243,7 @@ class Seq2SeqTransformer(nn.Module):
                     inputs['enc_action_mask'], self.enc_embedding_lookup, self.enc_candidate_ratio)
             encoder_inputs = F.dropout(encoder_inputs, self.dropout_rate, training)
             encoder_outputs = self.encoder_layer(encoder_inputs, boolean_mask[:, None, :],
-                                                  dtype=self.compute_dtype)
+                                                 dtype=self.compute_dtype)
             kv_cache = None
         else:
             encoder_outputs = self._tensor(cache['encoder_outputs'])
@@ -224,12 +251,18 @@ class Seq2SeqTransformer(nn.Module):
         if targets is None:
             return self._beam_search(encoder_outputs, boolean_mask)
         if not return_kv_cache:
+            kv_cache = None
+        offset = kv_cache['0']['key'].shape[1] if kv_cache is not None else 0
+        if not return_kv_cache:
             targets = F.pad(targets, (1, 0))[:, :-1]
         decoder_inputs = self._embed(targets, self.dec_embedding_lookup)
         if self.add_action_mask_to_inputs:
             decoder_inputs = decoder_inputs + self._candidates(
                 inputs['dec_action_mask'], self.dec_embedding_lookup, self.dec_candidate_ratio)
-        pos = self._position(inputs.get('dec_pos_encoding'), targets.shape[1])
+        explicit_positions = inputs.get('dec_pos_encoding')
+        pos = self._position(explicit_positions, targets.shape[1] + offset)
+        if explicit_positions is None:
+            pos = pos[:, offset:]
         if not return_kv_cache and inputs.get('dec_pos_encoding') is not None:
             pos = F.pad(pos, (0, 0, 1, 0))[:, :-1]
         decoder_inputs = F.dropout(decoder_inputs + pos, self.dropout_rate, training)
@@ -240,16 +273,15 @@ class Seq2SeqTransformer(nn.Module):
                         for i in range(self.decoder_layer.num_layers)}
         offset = kv_cache['0']['key'].shape[1] if kv_cache is not None else 0
         causal = torch.ones((length + offset, length + offset), device=targets.device,
-                             dtype=torch.bool).tril()[None, offset:, :]
+                            dtype=torch.bool).tril()[None, offset:, :]
         outputs = self.decoder_layer(decoder_inputs, causal, encoder_outputs,
                                      boolean_mask[:, None, :], kv_cache, self.compute_dtype)
         logits = F.linear(outputs.to(self.compute_dtype),
                           self.dec_embedding_lookup.weight.to(self.compute_dtype)).float()
+        action_mask = self._tensor(inputs['dec_action_mask'], torch.bool)
         if return_last_token:
             logits = logits[:, -1]
-        action_mask = self._tensor(inputs['dec_action_mask'], torch.bool)
-        if return_kv_cache:
-            action_mask = action_mask[:, 0, :]
+            action_mask = action_mask[:, -1]
         logits = torch.where(action_mask, logits, torch.finfo(torch.float32).min)
         if self.return_cache:
             return logits, dict(encoder_outputs=encoder_outputs, outputs=outputs, kv_cache=kv_cache)
@@ -329,17 +361,19 @@ def masked_loss(label, pred):
     label = torch.as_tensor(label, device=pred.device, dtype=torch.long)
     loss = F.cross_entropy(pred.flatten(0, 1), label.flatten(), reduction='none').reshape_as(label)
     mask = label != 0
-    return (loss * mask).sum() / mask.sum()
+    return (loss * mask).sum() / mask.sum().clamp_min(1)
 
 
 def masked_accuracy(label, pred):
     label = torch.as_tensor(label, device=pred.device, dtype=torch.long)
     mask = label != 0
-    return ((pred.argmax(dim=2) == label) & mask).float().sum() / mask.sum()
+    return ((pred.argmax(dim=2) == label) & mask).float().sum() / mask.sum().clamp_min(1)
 
 
 class CustomSchedule:
     def __init__(self, d_model, warmup_steps=4000):
+        if d_model <= 0 or warmup_steps <= 0:
+            raise ValueError('d_model and warmup_steps must be positive')
         self.d_model, self.warmup_steps = d_model, warmup_steps
 
     def __call__(self, step):
@@ -357,8 +391,14 @@ class KerasAdam(torch.optim.Optimizer):
         for group in self.param_groups:
             group['iterations'] += 1
 
+    @overload
+    def step(self, closure: None = None) -> None: ...
+
+    @overload
+    def step(self, closure: Callable[[], _Loss]) -> _Loss: ...
+
     @torch.no_grad()
-    def step(self, closure=None):
+    def step(self, closure: Callable[[], _Loss] | None = None) -> _Loss | None:
         loss = None
         if closure is not None:
             with torch.enable_grad():

@@ -12,6 +12,7 @@ setup(
     python_requires='>=3.10',
     install_requires=["torch>=2.4", "numpy>=1.26", "scipy>=1.11", "PyYAML>=6.0", "npn",
                       "graphviz", "nvidia-ml-py", "bitarray", "huggingface_hub"],
-    extras_require={"conversion": ["tensorflow>=2.18"], "test": ["pytest>=8"]},
+    extras_require={"conversion": ["tensorflow>=2.18"], "test": ["pytest>=8"],
+                    "check": ["pyright>=1.1.400", "ruff>=0.11", "autopep8>=2.3"]},
     package_data={'circuit_transformer': ['bin/*']}
 )

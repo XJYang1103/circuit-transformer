@@ -4,6 +4,7 @@ TensorFlow is imported only when a legacy checkpoint is explicitly loaded.
 Conversion never guesses a parameter by shape or silently skips a model weight.
 """
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -37,14 +38,14 @@ def parameter_mapping(model):
             for pt_att, tf_att in attentions:
                 for projection in ('query', 'key', 'value', 'output'):
                     yield (f'{pt}.{pt_att}.{projection}.weight',
-                           f'{tf}/{tf_att}/_{projection}_dense/kernel', out if projection == 'output' else qkv)
+                            f'{tf}/{tf_att}/_{projection}_dense/kernel', out if projection == 'output' else qkv)
             for pt_name, tf_name in (
                     ('intermediate', '_intermediate_dense' if side == 'encoder' else 'intermediate_dense'),
                     ('output', '_output_dense' if side == 'encoder' else 'output_dense')):
                 yield f'{pt}.{pt_name}.weight', f'{tf}/{tf_name}/kernel', transpose
                 yield f'{pt}.{pt_name}.bias', f'{tf}/{tf_name}/bias', identity
             norms = [('self_norm', '_attention_layer_norm' if side == 'encoder' else 'self_attention_layer_norm'),
-                     ('output_norm', '_output_layer_norm' if side == 'encoder' else 'output_layer_norm')]
+                        ('output_norm', '_output_layer_norm' if side == 'encoder' else 'output_layer_norm')]
             if side == 'decoder':
                 norms.append(('cross_norm', 'encdec_attention_layer_norm'))
             for pt_name, tf_name in norms:
@@ -57,7 +58,7 @@ def parameter_mapping(model):
 def save_checkpoint(model, path):
     path = Path(path)
     payload = dict(format=FORMAT, config=model.config,
-                   state_dict={k: v.detach().cpu() for k, v in model.state_dict().items()})
+                    state_dict={k: v.detach().cpu() for k, v in model.state_dict().items()})
     # Same-directory replacement avoids leaving a partial checkpoint on failure.
     import tempfile
     fd, temporary = tempfile.mkstemp(prefix=path.name + '.', suffix='.tmp', dir=path.parent)
@@ -74,11 +75,13 @@ def load_checkpoint(model, path):
     path = os.fspath(path)
     if path.endswith('.index'):
         path = path[:-6]
-    if os.path.isfile(path + '.index'):
+    if not os.path.isfile(path) and os.path.isfile(path + '.index'):
         return load_tensorflow_checkpoint(model, path)
     payload = torch.load(path, map_location='cpu', weights_only=True)
-    if payload.get('format') != FORMAT:
+    if not isinstance(payload, Mapping) or payload.get('format') != FORMAT:
         raise ValueError('Expected a Circuit Transformer PyTorch checkpoint saved with save().')
+    if 'config' not in payload or 'state_dict' not in payload:
+        raise ValueError('Checkpoint is missing config or state_dict.')
     if payload['config'] != model.config:
         raise ValueError(f'Checkpoint configuration mismatch: {payload["config"]} != {model.config}')
     state = payload['state_dict']
@@ -87,11 +90,15 @@ def load_checkpoint(model, path):
 
 
 def validate_state(model, state):
+    if not isinstance(state, Mapping):
+        raise ValueError('Checkpoint state_dict must be a parameter mapping.')
     expected = model.state_dict()
     if expected.keys() != state.keys():
         raise ValueError(f'Checkpoint parameter mismatch; missing={expected.keys() - state.keys()}, '
-                         f'unexpected={state.keys() - expected.keys()}')
+                        f'unexpected={state.keys() - expected.keys()}')
     for name, value in state.items():
+        if not isinstance(value, torch.Tensor):
+            raise ValueError(f'Checkpoint parameter is not a tensor: {name}')
         if value.shape != expected[name].shape:
             raise ValueError(f'Checkpoint shape mismatch for {name}: {value.shape} != {expected[name].shape}')
         if not torch.isfinite(value).all():
@@ -103,8 +110,8 @@ def load_tensorflow_checkpoint(model, prefix):
         import tensorflow as tf
     except ImportError as exc:
         raise ImportError('Legacy checkpoint conversion requires TensorFlow once. Install '
-                          'tensorflow in a conversion environment, load(prefix), then save("model.pt"). '
-                          'Native .pt inference and training do not require TensorFlow.') from exc
+                            'tensorflow in a conversion environment, load(prefix), then save("model.pt"). '
+                            'Native .pt inference and training do not require TensorFlow.') from exc
     reader = tf.train.load_checkpoint(prefix)
     variables = reader.get_variable_to_shape_map()
     state, used = {}, set()
@@ -117,7 +124,7 @@ def load_tensorflow_checkpoint(model, prefix):
         state[pt_name] = torch.from_numpy(np.array(transform(reader.get_tensor(name)), copy=True))
         used.add(name)
     unconverted = [name for name in variables if name not in used and name != '_CHECKPOINTABLE_OBJECT_GRAPH'
-                   and not name.startswith(('optimizer/', 'save_counter/'))]
+                    and not name.startswith(('optimizer/', 'save_counter/'))]
     if unconverted:
         raise ValueError(f'Unconverted TensorFlow variables: {unconverted}')
     validate_state(model, state)

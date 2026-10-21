@@ -13,6 +13,7 @@ import types
 
 def load_reference():
     import official
+    assert official.__file__ is not None
     root = Path(official.__file__).parent
     for name, relative in [('official.nlp.modeling', 'nlp/modeling'),
                            ('official.nlp.modeling.layers', 'nlp/modeling/layers'),
@@ -31,7 +32,8 @@ def load_reference():
         for name in names:
             setattr(layers, name, getattr(loaded, name))
     spec = importlib.util.spec_from_file_location('tf_reference',
-                                                 Path(__file__).with_name('tensorflow_transformer.py'))
+                                                  Path(__file__).with_name('tensorflow_transformer.py'))
+    assert spec is not None and spec.loader is not None
     reference = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(reference)
     return reference
@@ -47,6 +49,6 @@ def load_reference_circuit():
                             'from tf_reference import')
     sys.modules['tf_reference'] = reference
     module = types.ModuleType('circuit_reference')
-    module.nlp = types.SimpleNamespace(models=stacks)
+    setattr(module, 'nlp', types.SimpleNamespace(models=stacks))
     exec(compile(source, str(Path(__file__).with_name('model.py')), 'exec'), module.__dict__)
     return module

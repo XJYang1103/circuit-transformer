@@ -33,6 +33,9 @@ class ReplicaObjective(torch.nn.Module):
 class ReplicaDataParallel(torch.nn.DataParallel):
     def scatter(self, inputs, kwargs, device_ids):
         features, labels = inputs
+        if labels.shape[0] == 0 or not device_ids:
+            raise ValueError('Cannot scatter an empty batch or use an empty device list.')
+        device_ids = device_ids[:labels.shape[0]]
         quotient, remainder = divmod(labels.shape[0], len(device_ids))
         scattered, offset = [], 0
         # Match tf.distribute's balanced split, rather than torch.chunk's
@@ -40,29 +43,37 @@ class ReplicaDataParallel(torch.nn.DataParallel):
         for index, device_id in enumerate(device_ids):
             count = quotient + (index < remainder)
             end = offset + count
-            device = torch.device('cuda', device_id)
+            device = device_id if isinstance(device_id, torch.device) else torch.device('cuda', device_id)
             scattered.append(({key: value[offset:end].to(device) for key, value in features.items()},
-                              labels[offset:end].to(device)))
+                                labels[offset:end].to(device)))
             offset = end
-        return tuple(scattered), tuple(dict(kwargs) for _ in device_ids)
+        return tuple(scattered), tuple(dict(kwargs or {}) for _ in device_ids)
 
 
 def train_circuit(owner, train_data_dir, ckpt_save_path=None, validation_split=0.1,
-                  epochs=10, initial_epoch=0, batch_size=128, profile=False,
-                  distributed=False, latest_ckpt_only=False, log_dir='tensorboard',
-                  excluded_files=None, num_workers=8):
+                    epochs=10, initial_epoch=0, batch_size=128, profile=False,
+                    distributed=False, latest_ckpt_only=False, log_dir='tensorboard',
+                    excluded_files=None, num_workers=8):
     if not 0 <= validation_split < 1:
         raise ValueError('validation_split must be in [0, 1)')
     if num_workers < 0:
         raise ValueError('num_workers must be nonnegative')
+    if batch_size < 1:
+        raise ValueError('batch_size must be positive')
+    if not 0 <= initial_epoch < epochs:
+        raise ValueError('Expected 0 <= initial_epoch < epochs.')
     files = sorted(os.listdir(train_data_dir))
     np.random.seed(0)
     np.random.shuffle(files)
     excluded = set(excluded_files or [])
     files = [os.path.join(train_data_dir, name) for name in files if name not in excluded]
+    if any(not os.path.isfile(path) for path in files):
+        raise ValueError('Training data must contain files, not subdirectories.')
     split = int(len(files) * (1 - validation_split))
     if split == 0:
         raise ValueError('The training split contains no examples.')
+    if num_workers > 1 and split < 2:
+        raise ValueError('The asynchronous loader needs at least two training examples (it yields N-1 per epoch).')
     if ckpt_save_path is not None:
         os.makedirs(ckpt_save_path, exist_ok=True)
     model = owner._transformer
@@ -74,7 +85,6 @@ def train_circuit(owner, train_data_dir, ckpt_save_path=None, validation_split=0
             from .checkpoints import load_checkpoint
             load_checkpoint(model, owner.ckpt_path)
     old_cache, old_training = model.return_cache, model.training
-    model.return_cache = False
     objective = ReplicaObjective(model)
     if distributed and owner.device.type == 'cuda' and torch.cuda.device_count() > 1:
         if owner.device.index not in (None, 0):
@@ -84,7 +94,7 @@ def train_circuit(owner, train_data_dir, ckpt_save_path=None, validation_split=0
     schedule = CustomSchedule(owner.embedding_width)
     # Keras compile automatically enables dynamic loss scaling for mixed_float16.
     scaler = torch.amp.GradScaler(owner.device.type, init_scale=32768,
-                                 growth_interval=2000, enabled=owner.mixed_precision)
+                                    growth_interval=2000, enabled=owner.mixed_precision)
     iterations, batches_seen = 0, 0
     save_freq = split * (epochs - initial_epoch) // batch_size
     profiler = (torch.profiler.profile(on_trace_ready=torch.profiler.tensorboard_trace_handler(log_dir))
@@ -96,8 +106,9 @@ def train_circuit(owner, train_data_dir, ckpt_save_path=None, validation_split=0
     dataset = MPDataset(files, encoder.load_and_encode_formatted,
                         num_processes=num_workers, validation_split=validation_split)
     loaders = [DataLoader(GeneratorDataset(generator), batch_size=batch_size, num_workers=0)
-               for generator in (dataset.train_generator, dataset.validation_generator)]
+                for generator in (dataset.train_generator, dataset.validation_generator)]
     try:
+        model.return_cache = False
         with profiler as trace:
             for epoch in range(initial_epoch, epochs):
                 metrics = {}
@@ -122,7 +133,7 @@ def train_circuit(owner, train_data_dir, ckpt_save_path=None, validation_split=0
                                     optimizer.skipped_step()
                                 iterations += 1
                                 batches_seen += 1
-                                if profile:
+                                if trace is not None:
                                     trace.step()
                                 if ckpt_save_path is not None and latest_ckpt_only and (save_freq == 0 or batches_seen % save_freq == 0):
                                     from .checkpoints import save_checkpoint
@@ -143,10 +154,10 @@ def train_circuit(owner, train_data_dir, ckpt_save_path=None, validation_split=0
                     from .checkpoints import save_checkpoint
                     save_checkpoint(model, os.path.join(ckpt_save_path, f'model-{epoch + 1:04d}.pt'))
     finally:
-        if num_workers > 1:
-            dataset.process.terminate()
-            dataset.process.join()
+        dataset.close()
         model.return_cache = old_cache
         model.train(old_training)
     owner.training_history = history
+    if not distributed:
+        owner._weights_ready = True
     return None  # The original public train() method returns None.

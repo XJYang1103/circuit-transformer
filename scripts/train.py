@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
-"""Train the PyTorch Circuit Transformer with a YAML config on Linux.
+"""在 Linux 上使用 YAML 配置训练 PyTorch 版 Circuit Transformer。
 
-This CLI expands and validates paths, creates one directory per run, and
-passes the configured model and training options to CircuitTransformer.
-The model and its training loop remain in the circuit_transformer package.
+本命令行工具会展开并检查路径，为每次运行创建独立目录，
+并将配置中的模型参数和训练参数传给 CircuitTransformer。
+模型实现和训练循环位于 circuit_transformer 包中。
 
-Layout produced and consumed (see readme.md for the project conventions):
+输入和输出的目录结构（项目约定详见 readme.md)
 
-    ~/data/circuit-transformer/train/<dataset>/     .json training files
-    ~/runs/circuit-transformer/<timestamp>-<name>/
-        ckpt/           model-<epoch>.pt
-        tensorboard/    PyTorch profiler traces when `train.profile` is true
-        train.log       stdout/stderr of this run
+    ~/data/circuit-transformer/train/<数据集>/     .json 训练数据文件
+    ~/runs/circuit-transformer/<时间戳>-<名称>/
+        ckpt/                  模型权重:model-<轮次>.pt
+        tensorboard/           train.profile 为 true 时生成的 PyTorch 性能分析文件
+        resolved_config.yaml   本次运行实际使用的配置，包含命令行覆盖的参数
+        train.log              本次运行的标准输出和标准错误日志
 
-Usage:
+使用方法：
 
+    # 使用指定配置训练
     python scripts/train.py --config configs/train_deepsyn.yaml
+
+    # 仅检查并显示运行配置，不执行训练
     python scripts/train.py --config configs/train_deepsyn.yaml --dry-run
+
+    # 将训练总轮数覆盖为 1
     python scripts/train.py --config configs/train_deepsyn.yaml --epochs 1
 """
 
 import argparse
 import datetime
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -54,6 +61,13 @@ def load_config(path):
     return config
 
 
+def effective_options(call, supplied):
+    """Fill in callable defaults without changing the supplied arguments."""
+    bound = inspect.signature(call).bind_partial(**supplied)
+    bound.apply_defaults()
+    return dict(bound.arguments)
+
+
 def check_data_dir(path):
     """Validate the directory the way `train()` consumes it.
 
@@ -67,8 +81,7 @@ def check_data_dir(path):
         sys.exit(
             "Training data directory not found:\n"
             "  %s\n\n"
-            "Fetch the dataset first:\n"
-            "  scripts/download_data.sh\n"
+            "Download and extract the dataset described in readme.md,\n"
             "then point paths.data_dir at the directory that directly holds\n"
             "the .json files." % path)
 
@@ -156,6 +169,10 @@ def main(argv=None):
         model_cfg['device'] = args.device
     if args.num_workers is not None:
         train_cfg['num_workers'] = args.num_workers
+    if args.resume is not None:
+        model_cfg['ckpt_path'] = args.resume
+    model_cfg['ckpt_path'] = (resolve(model_cfg['ckpt_path'])
+                              if model_cfg.get('ckpt_path') else None)
 
     num_files = check_data_dir(data_dir)
 
@@ -170,7 +187,8 @@ def main(argv=None):
     print("Checkpoints  : %s" % ckpt_dir)
     print("Epochs/batch : %s / %s" % (train_cfg.get('epochs'), train_cfg.get('batch_size')))
     print("Device/workers: %s / %s" % (model_cfg.get('device', 'auto'),
-                                     train_cfg.get('num_workers', 8)))
+                                       train_cfg.get('num_workers', 8)))
+    print("Initial weights: %s" % (model_cfg['ckpt_path'] or 'random initialization'))
 
     if args.dry_run:
         print("\n--dry-run: plan resolved, nothing was trained.")
@@ -179,6 +197,9 @@ def main(argv=None):
     # Keep the run directory ready for both checkpoints and optional traces.
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
+
+    # Keep optional PyTorch profiler traces with this run.
+    train_cfg['log_dir'] = log_dir
 
     log_handle = open(os.path.join(run_dir, 'train.log'), 'a',
                       encoding='utf-8', buffering=1)
@@ -192,13 +213,27 @@ def main(argv=None):
                  "Install the package and its dependencies first:\n"
                  "  pip install -e ." % exc)
 
-    if args.resume:
-        model_cfg['ckpt_path'] = resolve(args.resume)
-
     model = ct.CircuitTransformer(**model_cfg)
 
-    # Keep optional PyTorch profiler traces with this run.
-    train_cfg['log_dir'] = log_dir
+    # Record the exact options used, including defaults omitted from the YAML.
+    model_options = effective_options(ct.CircuitTransformer, model_cfg)
+    model_options['device'] = str(model.device)
+    train_options = effective_options(model.train, dict(
+        train_data_dir=data_dir, ckpt_save_path=ckpt_dir, **train_cfg))
+    train_options.pop('train_data_dir')
+    train_options.pop('ckpt_save_path')
+    resolved_config = {
+        'run': {'name': run_name},
+        'paths': {'data_dir': data_dir, 'output_root': output_root},
+        'model': model_options,
+        'train': train_options,
+    }
+    import yaml
+    resolved_config_path = os.path.join(run_dir, 'resolved_config.yaml')
+    with open(resolved_config_path, 'w', encoding='utf-8') as config_handle:
+        yaml.safe_dump(resolved_config, config_handle, sort_keys=False,
+                       allow_unicode=True)
+    print("Resolved config: %s" % resolved_config_path)
 
     model.train(train_data_dir=data_dir,
                 ckpt_save_path=ckpt_dir,

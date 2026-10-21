@@ -4,7 +4,7 @@
 
 ## 语义保持范围
 
-- 电路 token 编码、树位置编码输入、动作可行性约束、don't-care、节点共享、奖励、MCTS 选择／回传和溢出处理保持原算法。测试通过 AST 对比检查主要方法未改动。
+- 电路 token 编码、树位置编码输入、动作可行性约束、don't-care、节点共享、奖励、MCTS 选择／回传和溢出处理保持原算法。仍未变更的方法继续通过 AST 对比检查；修复过的入口和边界条件通过行为回归测试及跨框架数值测试检查。
 - Transformer 保留 pre-norm、ReLU、attention 无偏置、前馈层有偏置、1e-6 LayerNorm、最终归一化、词嵌入缩放和解码器输出权重共享。
 - 保留训练时目标 token 与树位置右移，候选动作掩码不右移；推理缓存的 K/V 布局仍为“批次、序列、头数、头维度”。
 - 保留 PAD=0 的损失／准确率屏蔽规则、warmup 学习率（第 0 步为 0）、Keras Adam 的 epsilon 放置与偏差修正，以及混合精度动态 loss scaling。溢出跳过更新时，迭代计数仍按 Keras 规则增加。
@@ -13,9 +13,9 @@
 
 ## 训练数据读取：按用户要求保留原行为
 
-默认 `num_workers=8`。继续使用 1024 个文件分块、`imap_unordered(..., chunksize=128)`、跨 epoch 持续存在的队列，以及“计数先加 1、再判断计数 < 训练样本数”的原始条件。若训练样本数为 N，每轮返回 N−1 个，下一项留在队列中进入后续轮次。没有改成完整遍历，也没有新增 worker 随机种子或顺序排序。
+默认 `num_workers=8`。继续使用 1024 个文件分块、`imap_unordered(..., chunksize=128)` 和跨 epoch 持续存在的队列。保持原条件对应的样本数：若训练样本数为 N，每轮返回 N−1 个，下一项留在队列中进入后续轮次。没有改成完整遍历，也没有新增 worker 随机种子或顺序排序。
 
-直接调用 `utils.py` 中原封未动的 `MPDataset`；没有新增 Windows 兼容层，也没有改写原多进程生产者。Linux 多进程回归测试仅在 Linux 执行，在其他系统上会明确跳过。
+训练继续调用 `utils.py` 的 `MPDataset`，不新增 Windows 兼容层。本次修复增加工作进程异常向主进程传播、映射函数关键字参数传递及显式关闭，避免数据读取失败后主进程持续等待。训练样本不足两条时，多进程入口明确报错；单进程仍可训练单条样本。原有跨 epoch 样本顺序和队列延续测试仍然通过。
 
 `num_workers=0` 或 `1` 对应原 MPDataset 的单进程分支，每轮返回全部样本；它是显式调试选项，不是迁移后的默认值。异步读取与随机增强本来就不能保证固定训练轨迹。
 
@@ -28,15 +28,17 @@ python -m pip install -e .
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-远端提交 `cd4b2eb` 的 `configs/train_deepsyn.yaml`、`scripts/train.py` 和
-`scripts/download_data.sh` 已合入。训练入口继续使用原来的数据目录、时间戳运行目录
-和日志布局；输出权重改为 `ckpt/model-0001.pt`。先检查配置中的服务器路径，再执行：
+仓库已有 `configs/train_deepsyn.yaml` 和 `scripts/train.py`。先从 README
+所列数据集地址下载、解压数据，并将 `paths.data_dir` 指向直接包含 `.json` 文件的
+目录。训练入口使用时间戳运行目录；输出权重为 `ckpt/model-0001.pt`，
+本次有效配置保存在 `resolved_config.yaml`。先检查配置中的服务器路径，再执行：
 
 ```bash
 python scripts/train.py --config configs/train_deepsyn.yaml --dry-run
 python scripts/train.py --config configs/train_deepsyn.yaml
 ```
 
+配置中的 `model.ckpt_path: null` 表示随机初始化；测试权重不会自动加载。
 `--resume /path/model-0010.pt` 从模型权重开始新训练；与原版训练入口相同，
 优化器状态和学习率步数不会恢复。`initial_epoch` 只决定循环起点，不恢复优化器。
 配置文件默认 `device: cuda`、`num_workers: 8`；训练脚本支持命令行覆盖。
@@ -70,7 +72,9 @@ python -m circuit_transformer.convert_checkpoint /path/deepsyn_reinforced /path/
 
 自定义结构需传递对应参数，可用 `--help` 查看。把 `.pt` 复制到服务器后，日常训练／推理不需要 TensorFlow：
 
-本次已将官方 `deepsyn_reinforced` 权重转换为仓库下的 `checkpoints/deepsyn_reinforced.pt`（约 353 MB，367 个参数张量），并通过保存／加载逐张量完全一致检查。该大文件已加入 Git 忽略规则，部署时需要单独复制。
+先前迁移验收曾将官方 `deepsyn_reinforced` 权重转换成 `.pt` 并做逐张量
+保存／加载检查；当前仓库不包含该文件，`checkpoints/` 也被 Git 忽略。
+需要旧权重时，请自行转换并将 `.pt` 复制到服务器。从零训练无需这一步。
 
 ```python
 model = ct.CircuitTransformer(ckpt_path='/path/deepsyn_reinforced.pt', device='cuda')

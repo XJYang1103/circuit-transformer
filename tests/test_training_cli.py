@@ -36,11 +36,27 @@ def test_yaml_cli_dry_run_and_train(tmp_path):
     planned = subprocess.run(command + ['--dry-run'], capture_output=True,
                              text=True, check=True)
     assert 'Device/workers: cpu / 0' in planned.stdout
+    assert 'Initial weights: random initialization' in planned.stdout
+    assert not output.exists()
+
+    initialized = subprocess.run(command + ['--resume', str(tmp_path / 'init.pt'),
+                                            '--dry-run'], capture_output=True,
+                                 text=True, check=True)
+    assert 'Initial weights: %s' % (tmp_path / 'init.pt') in initialized.stdout
     assert not output.exists()
 
     completed = subprocess.run(command, capture_output=True, text=True, check=True)
     run_dir, = output.glob('*-cli-smoke')
     checkpoint = run_dir / 'ckpt' / 'model-0001.pt'
     assert checkpoint.is_file()
+    resolved = yaml.safe_load((run_dir / 'resolved_config.yaml').read_text())
+    assert resolved['paths'] == {'data_dir': str(data), 'output_root': str(output)}
+    assert resolved['model']['device'] == 'cpu'
+    assert resolved['model']['ckpt_path'] is None
+    assert resolved['model']['inference_batch_size'] == 512
+    assert resolved['train']['num_workers'] == 0
+    assert resolved['train']['initial_epoch'] == 0
+    assert resolved['train']['log_dir'] == str(run_dir / 'tensorboard')
     assert 'Epoch 1/1:' in (run_dir / 'train.log').read_text()
+    assert 'Initial weights: random initialization' in completed.stdout
     assert 'model-XXXX.pt' in completed.stdout

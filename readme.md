@@ -40,19 +40,27 @@ Native `.pt` training and inference do not import TensorFlow. The existing
 
 ## Train on Linux
 
-The repository includes a YAML-driven PyTorch training entry point. Edit
-`configs/train_deepsyn.yaml` for your server paths and training settings, then run:
+Download `8_inputs_2_outputs_random_deepsyn.zip` from the
+[dataset repository](https://huggingface.co/datasets/snowkylin/circuit-transformer)
+and extract it. Set `paths.data_dir` in `configs/train_deepsyn.yaml` to the
+directory that directly contains the `.json` files. Set `paths.output_root`,
+model parameters, and training parameters in the same YAML file. The supplied
+config sets `model.ckpt_path: null`, so training starts with randomly initialized
+PyTorch weights. Preview the resolved paths and weight source, then train:
 
 ```bash
 python scripts/train.py --config configs/train_deepsyn.yaml --dry-run
 python scripts/train.py --config configs/train_deepsyn.yaml
 ```
 
-`scripts/download_data.sh` retains the dataset download layout. Each run is
-written beneath the configured output root with `.pt` weights and a `train.log`.
+Each run is written beneath the configured output root with
+`ckpt/model-0001.pt`, `resolved_config.yaml`, and `train.log`.
 The default eight-process data reader keeps the original asynchronous loading
-behavior. `--resume /path/model-0010.pt` loads model weights, but training starts
-with a new optimizer and learning-rate schedule, as in the original `train()`.
+behavior. Test-created weights live in temporary test directories and are never
+loaded automatically. `--resume /path/model-0010.pt` overrides
+`model.ckpt_path` and initializes from model weights, but training starts with a
+new optimizer and learning-rate schedule, as in the original `train()`; it is
+not an exact continuation of the earlier run.
 See [MIGRATION.md](MIGRATION.md) for details and server acceptance tests.
 
 You need to install GraphViz separately as follows if you need to visualize the network.
@@ -257,34 +265,28 @@ twine upload dist/circuit-transformer-x.x.tar.gz
 }
 ```
 
-# 框架
-## 1. configs/ —— 目录
-- 存放训练配置的目录。一个 YAML 文件 = 一种训练设置
-- 就是**把所有训练超参、路径、模型参数全部写在一个配置文件里**。
-### configs/train_deepsyn.yaml
-- run.name	拼进 run 目录名，用来区分实验
-- paths.*	data_dir 指向数据、output_root 是产物根目录。~ / $HOME 由 0 train.py 展开
-- model.*	原样展开成 CircuitTransformer(...) 的构造参数
-- train.*	原样展开成 train() 的关键字参数
+# 项目结构与训练流程
 
-## 2.scripts/ —— 目录
-### scripts/train.py  
+| 位置 | 作用 |
+| --- | --- |
+| `configs/train_deepsyn.yaml` | 写数据路径、模型大小和训练参数；`model.ckpt_path: null` 表示从零训练。 |
+| `scripts/train.py` | 读取 YAML，应用命令行覆盖，预览参数并启动训练。 |
+| `circuit_transformer/model.py`、`pytorch_transformer.py`、`training.py` | 分别负责电路算法与公开接口、PyTorch 模型、训练循环。 |
+| `circuit_transformer/checkpoints.py` | 保存和加载 `.pt`；需要时一次性转换旧 TensorFlow 权重。 |
+| `tests/` | 小样本训练、模型保存加载及迁移对照测试。 |
 
-读取YAML的配置运行模型：
-- 读 YAML → 展开路径 → 校验数据目录 → 建时间戳 run 目录
-- → 预建 ckpt/ 和 tensorboard/ → stdout/stderr 同时写进 train.log
-- → 构造 CircuitTransformer → 调 train()
-##  仓库外面那两个目录
-- `~/data/circuit-transformer/          ← 数据，不在 git 里`
-- ├── raw/     三个原始文件 + sha256 锁定
-- ├── train/   解压后的 508 万个 json
-- └── test/    random_circuits/ + IWLS_FFWs/  
+YAML 只保存参数；实际计算由 PyTorch 完成。从零训练时，不会读取测试生成的权重。
+`--dry-run` 会显示路径、设备、训练轮数和初始权重来源，也不会创建运行目录。
+正式运行后，结果存放在 `paths.output_root/<时间戳>-<run.name>/`：
 
--` ~/runs/circuit-transformer/          ← 训练产物，不在 git 里`
-- └── <时间戳>-<名字>/
--    ├── ckpt/          model-0001.index / .data-00000-of-00001
--    ├── tensorboard/
--    └── train.log
+```text
+ckpt/model-0001.pt   模型参数
+resolved_config.yaml 本次 YAML、命令行覆盖及代码默认值合并后的配置
+train.log            训练输出
+tensorboard/         启用 profile 时的性能追踪
+```
+
+数据和运行结果建议放在仓库外。`paths.data_dir` 必须直接指向 `.json` 文件所在目录。
 
 
 
