@@ -13,12 +13,10 @@
 #
 # 路径可以是绝对路径，也可以以 ~ / $HOME 开头；train.py 脚本会自动展开。
 # CLI 会在调用 PyTorch 训练循环之前展开路径。
-#
-# 这些参数是从零训练的起点，不是已经调优好的最终方案。
-# README 没有记录发布的 `deepsyn_reinforced` 权重对应的精确训练超参。
+
 run:
   # 实验输出目录格式：<output_root>/<时间戳>-<run_name>/
-  name: deepsyn_8i2o
+  name: deepsyn_8i2o_1
 paths:
   # 存放训练json文件的目录，train()会把该目录下所有文件都当作训练文件。
   # 从 README 中的数据集地址下载并解压；指向直接包含 .json 文件的
@@ -45,17 +43,28 @@ model:
   # null = 随机初始化，从零训练；测试权重不会自动加载。
   # 如需从已有模型参数开始新训练，可填 .pt 路径或使用 --resume。
   # 该方式不会恢复优化器和学习率进度。
-  ckpt_path: null
+
+  #权重路径
+  ckpt_path: null  #null是从随机权重开始训练，如果想从从已有权重继续训练，那就在这里加上.pt的路径
 
 train:
   # 参数直接传给 CircuitTransformer.train()
   epochs: 10
+
   batch_size: 128
-  validation_split: 0.1
+#改 batch 会连累学习率曲线，而它现在是写死的
+# CustomSchedule 按优化器步数算学习率（training.py:127），warmup 4000 步写死、配置里改不到。batch 128 → 256 会让：
+# 每 epoch 步数 35719 → 17859，减半
+# 10 epoch 结束时的学习率差 √2 ≈ 1.41 倍
+# 热身覆盖的样本量翻倍
+#比如本来规定前几个epoch学习率每轮提高一点，但是越往后就要修改他，比如让学习率每轮减少一点
+
+
+  validation_split: 0.1  #约 90% 数据训练，10% 数据验证
   initial_epoch: 0
   # 默认使用原版 MPDataset 的 8 进程无序数据生成方式，
   # 每轮样本数保持为 N−1；仅在调试时设为 0。
-  num_workers: 8
+  num_workers: 8  #使用 8 个进程进行训练数据加载和编码
 
   # false = 每轮保存一个 .pt 权重文件；true = 按原版批次间隔保存，
   # 因此仍可能在多轮中生成文件。
@@ -64,4 +73,9 @@ train:
   # true = 在 <run_dir>/tensorboard 写入 PyTorch profiler 追踪数据。
   # 性能分析有额外开销，常规训练保持关闭。
   profile: false
-  distributed: false
+
+  # true = 用两块 V100 做数据并行（每张卡各分一半 batch，梯度取平均）。
+  # 前置条件：卡间 P2P 必须正常。本机曾因 AMD IOMMU 拦截 P2P 写入而静默返回全 0，
+  # 已在 GRUB 加 iommu=pt 修复（详见提交历史与内核 cmdline）。若换机器或重装系统，
+  # 先用 50 次跨卡拷贝测试确认 P2P 正确再开启，否则会得到静默错误的梯度。
+  distributed: true  #是否使用多卡

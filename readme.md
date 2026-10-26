@@ -219,11 +219,37 @@ Circuit Transformer原生支持**无关项**。即只要求部分输入组合保
 - `epochs`：训练轮数
 - `batch_size`：单批次电路样本数量
 
-训练完成，使用 `CircuitTransformer.load(ckpt_path)` 加载权重。
+# 数据JSON
 
-### 测试数据集
+每个 JSON 是一个 4 元素的列表：
+
+[原始AIG字符串, 原始电路与门数量, 目标优化后AIG字符串, 目标电路与门数量]
+
+AIG/AAG是一种文本格式的组合逻辑电路表示：文件头 aag M I L O A 记录节点数、输入数、锁存器数、输出数、与门数；
+
+- 训练完成，使用 `CircuitTransformer.load(ckpt_path)` 加载权重。
+
+# 测试数据集
 
 随机电路、IWLS基准测试集放在数据集仓库的`test_data.zip`，格式和训练集一致；评估时只使用原始输入电路。
+
+- IWLS_FFWs —— IWLS 基准电路:
+
+评估时只使用原始输入电路"——IWLS 电路用于测试模型时，只需要原始电路本身，不需要用优化版本，所以优化后 AIG 没有单独存一份，而是用原始电路占位，但优化后的门数(34,28)仍作为标签保留了下来。
+```
+["aag 42 8 0 2 34\n2\n4\n6...", 34, 
+ "aag 42 8 0 2 34\n2\n4\n6...", 28]
+```
+- random_circuits —— 随机电路
+
+里面是测试集，前一个电路是原始的，后一个优化后的，让模型学习如何找到优化的电路
+
+每个文件里第一段 AIG 是原始电路，第三段 AIG 是它的优化版本——用逻辑综合工具 ABC 的 &deepsyn 命令优化后的结果，与门数量明显更少
+```
+["aag 38 8 0 2 30\n2\n4\n6...", 30,
+ "aag 26 8 0 2 18\n2\n4\n6...", 18]
+```
+
 
 ## 打包构建
 
@@ -290,20 +316,61 @@ tensorboard/         开启性能分析后生成的追踪文件
 3. 编辑`configs/train_deepsyn.yaml`：设置`paths.data_dir`、`paths.output_root`和`run.name`，按需要调整模型和训练参数。默认从零训练（`model.ckpt_path: null`），训练10轮、批大小128、验证比例0.1、8进程读取数据。
 4. 检查路径与参数，然后正式启动：
 
+5.需要断开远程连接后继续训练，可以在服务器已安装的 tmux 中运行：
+```bash
+tmux new -s circuit_train
+```  
+
+- 进入后，再执行上述进入项目、激活环境和启动训练的命令。
+- 暂时离开时，依次按：
+Ctrl+B，然后按 D
+- 回来查看：
+```bash
+tmux attach -t circuit_train
+```
+- 启动训练  
+
 ```bash
 python scripts/train.py --config configs/train_deepsyn.yaml --dry-run
 python scripts/train.py --config configs/train_deepsyn.yaml
-```
+```  
 
-`--dry-run`会检查数据目录并显示运行计划，不导入PyTorch，也不会验证GPU是否可用或逐个解析JSON内容。正式训练的运行目录以正式启动时生成的时间戳为准。
+`--dry-run`会检查数据目录并显示运行计划，不导入PyTorch，也不会验证GPU是否可用或逐个解析JSON内容。正式训练的运行目录以正式启动时生成的时间戳为准。  
+
+它会显示：
+- 数据目录和文件数；
+- 实验输出目录；
+- epoch 和 batch size；
+- 设备与数据进程数；
+- 权重来源是否为 random initialization。
+--dry-run 不会检查 GPU 是否可用，也不会验证每个 JSON 的内容   
 
 如需从已有PyTorch权重开始新一轮训练，使用下面的命令，并保证配置中的模型结构与权重匹配：
 
 ```bash
-python scripts/train.py --config configs/train_deepsyn.yaml --resume /path/model-0010.pt
-```
+python -u scripts/train.py --config configs/train_deepsyn.yaml --resume /path/model-0010.pt
+```  
+
+`-u`是及时显示已有输出  
+
 
 `--resume`只恢复模型参数，优化器和学习率进度重新开始；`train.initial_epoch`只控制轮次起点，不恢复训练状态。
+
+## 训练的时候监控指标：
+### 终端1：监控显卡信息  
+
+watch -n 1 nvidia-smi ：每隔1秒刷新一次 PU状态，按 Ctrl+C 退出监控。  
+
+重点看：
+| 字段 | 含义 |
+|---|---|
+| `Memory-Usage` | 已用显存 / 总显存，帮助判断 batch size 是否太大 |
+| `GPU-Util` | GPU 利用率，观察 GPU 是否正在计算 |
+| `Temp` | GPU 温度 |
+| `Processes` | 使用 GPU 的进程，训练时通常能看到 Python |
+### 终端2：查看训练日志  
+tail -n 50 -f "/home/xiejinyang/runs/circuit-transformer/<时间戳>-deepsyn_8i2o_1/train.log"
+
 
 ## 文件执行顺序与训练流程
 
@@ -365,6 +432,18 @@ Circuit Transformer/                       # 项目目录
     │   ├── model-0002.pt
     │   └── ...                            # 默认训练完成后到 model-0010.pt
     └── tensorboard/                       # 启动时创建；profile: true时写入性能追踪
+
+data/
+└── circuit-transformer/
+    ├── raw/
+    ├── test/
+    │   ├── IWLS_FFWs/  
+    │   └── random_circuits/
+    ├── train/
+    │   └── 8_inputs_2_outputs_random_deepsyn/
+    └── train_part2/
+        └── 8_inputs_2_outputs_random_deepsyn/
+
 ```
 
 训练使用已有配对数据，不会自动运行ABC生成新数据集，也不会将增强后的样本、编码张量或优化后的AIG另存为文件。训练指标记录在`train.log`，同时保留在当前模型对象的`training_history`中；不会自动生成单独的指标CSV。`.pt`包含模型配置和参数，不包含优化器状态。

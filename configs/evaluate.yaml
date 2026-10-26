@@ -1,0 +1,19 @@
+# 在 IDE 中打开 scripts/evaluate.py，点击“运行 Python 文件”即可测试。
+# 选择解释器：~/miniforge3/envs/circuit_transformer_py312/bin/python
+# YAML 仅保存参数，实际运行的是 evaluate.py；无需输入命令行参数。
+# 支持 ~ 和环境变量；相对路径以本 YAML 文件所在目录为基准。
+
+# 使用训练时保存的配置，保证模型结构与权重一致。
+config: ~/runs/circuit-transformer/20261023-173337-deepsyn_8i2o_1/resolved_config.yaml
+checkpoint: ~/runs/circuit-transformer/20261023-173337-deepsyn_8i2o_1/ckpt/model-0010.pt
+
+# 递归读取两个子集；只测一个子集时，在路径后加 /random_circuits 或 /IWLS_FFWs。
+data_dir: ~/data/circuit-transformer/test
+
+# 每次运行生成新目录，避免覆盖结果。输出 results.csv 和 summary.json。
+output_dir: ~/runs/circuit-transformer/20261023-173337-deepsyn_8i2o_1/test-{timestamp}
+
+device: cuda       # 使用 GPU；无 GPU 时改为 cpu
+batch_size: 256    # 显存不足时调小，例如 32
+limit: null       # null = 全部测试；先试跑可设为 32（按文件名排序取前 32 条）
+mcts_steps: 0      # 0 = 不启用 MCTS；1 = 启用，耗时会增加
