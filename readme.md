@@ -307,7 +307,7 @@ tensorboard/         开启性能分析后生成的追踪文件
 
 建议数据集、实验输出放在项目仓库外面。`paths.data_dir`必须直接指向json文件所在文件夹。
 
-## 训练启动步骤
+# 一.训练启动步骤
 
 以下命令均在项目根目录执行。
 
@@ -399,7 +399,105 @@ scripts/train.py
 
 每轮先训练，再验证；验证阶段不更新参数。默认8进程异步加载延续原版行为：训练集有N条样本时，每轮返回N−1条，预取队列跨轮延续；`num_workers: 0`或`1`使用单进程，每轮读取全部训练样本。默认`latest_ckpt_only: false`，每轮结束保存一个权重文件，并将训练/验证损失和准确率打印到终端及`train.log`。
 
-## 数据与输出目录
+# 二. 测试
+
+1. 检查测试配置
+
+打开 configs/evaluate.yaml，确认以下路径与实际训练目录一致：
+```bash
+# 训练时保存的模型结构配置
+config: ~/runs/circuit-transformer/20261023-173337-deepsyn_8i2o_1/resolved_config.yaml
+
+# 第 10 轮模型权重
+checkpoint: ~/runs/circuit-transformer/20261023-173337-deepsyn_8i2o_1/ckpt/model-0010.pt
+
+# 测试数据目录
+data_dir: ~/data/circuit-transformer/test
+
+# 测试结果输出目录
+output_dir: ~/runs/circuit-transformer/20261023-173337-deepsyn_8i2o_1/test-{timestamp}
+
+device: cuda:1
+batch_size: 128
+limit: null
+mcts_steps: 0
+```
+2. 启动测试
+
+在项目根目录激活训练时使用的 Python 环境，然后执行：
+```bash
+# 检查配置和路径，不正式测试
+python scripts/evaluate.py --dry-run
+
+# 正式开始测试
+python -u scripts/evaluate.py
+```
+也可以直接点击运行scripts/evaluate.py
+
+3. 查看结果
+
+测试结果保存在配置的输出目录中，例如：
+
+```text
+~/runs/circuit-transformer/
+└── 20261023-173337-deepsyn_8i2o_1/
+    ├── ckpt/
+    │   └── model-0010.pt
+    └── test-<时间戳>/
+        ├── results.csv       # 每条电路的测试结果
+        └── summary.json      # 全部测试完成后的汇总
+```
+
+要测试 PPO 权重时，把 checkpoint 改为对应的 ppo-<时间戳>/model-ppo.pt 即可；config 仍使用原训练实验的 resolved_config.yaml，因为 PPO 微调沿用了相同的模型结构。
+
+# 3.PPO 小规模微调
+
+PPO 配置在 `configs/ppo.yaml`，启动入口是 `scripts/train_ppo.py`。默认加载第 10 轮权重，从训练目录随机抽取 32 个电路，每个采样 2 条生成轨迹，随后使用同一批轨迹更新 2 轮。这里的“一轮 PPO”指一次轨迹采集及其更新，不是遍历完整训练集。
+
+在项目根目录、已激活训练环境后运行：
+
+```bash
+python scripts/train_ppo.py --dry-run  # 检查配置和路径，不训练
+python -u scripts/train_ppo.py          # 正式运行
+```
+
+也可在 IDE 打开 `scripts/train_ppo.py` 并点击运行；或通过 `--config /path/ppo.yaml` 指定另一份配置。设备、采样数量、更新次数、学习率等都在 YAML 中修改。默认使用 `cuda:1` 和 float32，显存不足可先减小电路数量或切换设备；更新逐条轨迹计算梯度，`minibatch_size` 控制累积后每次更新的轨迹数。
+
+程序执行顺序和数据流：
+
+```text
+configs/ppo.yaml + 训练的 resolved_config.yaml + model-0010.pt
+  → scripts/train_ppo.py：检查配置，扫描训练 JSON，抽取原始电路
+  → circuit_transformer/ppo.py：编码电路，创建 LogicNetworkEnv
+  → Circuit Transformer：用合法动作掩码逐 token 采样，记录旧策略概率
+  → LogicNetworkEnv：构建电路，检查完成情况和真值表，统计 AND 门数
+  → 同一电路的其他采样结果构成基线，计算优势
+  → PPO 裁剪目标：重新计算动作概率、反向传播、更新参数
+  → 新输出目录：model-ppo.pt、resolved_ppo.yaml、rollouts.jsonl、metrics.json
+```
+
+成功生成并且真值表等价时，奖励为原始 AND 数减生成 AND 数；失败或不等价时奖励为 `-failure_penalty`。日志中的 reward 是采样时的奖励，`approx_kl` 和 `clip_fraction` 用于观察策略变化。每个输入电路的采样奖励完全相同时，该组优势为零，不产生策略梯度。扫描数百万个文件可能耗时，采样和更新逐条处理，首次试跑也可能较慢。输出权重只包含模型参数，不包含优化器状态，不能无缝恢复 PPO 更新。
+
+PPO 默认输出目录格式如下，每次运行都会创建一个新的目录：
+
+```text
+~/runs/circuit-transformer/
+├── ppo-20261030-.../             # 一次 PPO 运行
+│   ├── model-ppo.pt              # PPO 微调后的模型权重
+│   ├── resolved_ppo.yaml         # 本次运行使用的完整 PPO 配置
+│   ├── rollouts.jsonl            # 每条采样轨迹的奖励、成功情况和门数
+│   └── metrics.json              # 每次参数更新的损失和其他指标
+└── ppo-20261030-.../             # 另一次 PPO 运行
+    ├── model-ppo.pt
+    ├── resolved_ppo.yaml
+    ├── rollouts.jsonl
+    └── metrics.json
+```
+
+评估时，将 `configs/evaluate.yaml` 的 `checkpoint` 指向新目录的 `model-ppo.pt`，原训练 `config` 不变；使用相同测试集分别评估原始权重和 PPO 权重。评估集不要用于 PPO 采样。`rollouts.jsonl` 保存每条轨迹的文件路径、奖励、成功情况和门数，`metrics.json` 保存每次更新的损失、近似 KL、裁剪比例及梯度范数。
+
+
+# 数据与输出目录
 
 按当前配置，目录结构如下（JSON文件名仅作示意）：
 
@@ -423,15 +521,32 @@ Circuit Transformer/                       # 项目目录
     ├── sample_000002.json
     └── ...
 
-~/runs/circuit-transformer/                 # paths.output_root
-└── <时间戳>-deepsyn_8i2o/                   # 一次实验，后缀来自 run.name
-    ├── resolved_config.yaml               # 本次实际使用的配置
-    ├── train.log                          # 训练期间的标准输出和标准错误
-    ├── ckpt/
-    │   ├── model-0001.pt                   # 第1轮结束的模型权重
-    │   ├── model-0002.pt
-    │   └── ...                            # 默认训练完成后到 model-0010.pt
-    └── tensorboard/                       # 启动时创建；profile: true时写入性能追踪
+~/runs/circuit-transformer/     # paths.output_root
+├── <时间戳>-deepsyn_8i2o_1/      # 一次实验，后缀来自 run.name
+│   ├── resolved_config.yaml    # 本次实际使用的配置
+│   ├── train.log               # 训练期间的标准输出和标准错误
+│   ├── ckpt/
+│   │   ├── model-0001.pt       # 第1轮结束的模型权重
+│   │   ├── model-0002.pt
+│   │   ├── ...
+│   │   └── model-0010.pt       # 第10轮结束的模型权重
+│   ├── tensorboard/            # profile: true 时写入性能追踪
+|   |
+│   ├── test-20261026-.../      # 一次测试运行
+│   │   ├── results.csv         # 每条电路的测试结果
+│   │   └── summary.json        # 全部完成后的汇总
+│   └── test-20261026-.../      # 另一次测试运行
+│       ├── results.csv
+│       └── summary.json
+|
+└─ ppo-<时间戳>_1/              # 一次 PPO 运行，与训练实验目录同级
+    ├── resolved_ppo.yaml       # 本次 PPO 实际使用的配置
+    ├── metrics.json            # 每次参数更新的损失和其他指标
+    └── model-ppo.pt            # PPO 微调后的模型权重
+    └── test-<时间戳>/
+        ├── results.csv       # 每条电路的测试结果
+        └── summary.json      # 测试完成后的汇总
+
 
 data/
 └── circuit-transformer/
@@ -449,4 +564,5 @@ data/
 训练使用已有配对数据，不会自动运行ABC生成新数据集，也不会将增强后的样本、编码张量或优化后的AIG另存为文件。训练指标记录在`train.log`，同时保留在当前模型对象的`training_history`中；不会自动生成单独的指标CSV。`.pt`包含模型配置和参数，不包含优化器状态。
 
 训练结束后，以与训练相同的模型结构创建`CircuitTransformer`，通过`ckpt_path`或`load()`加载`ckpt/`下的权重，再调用`optimize()`优化电路。优化结果作为AIG列表返回；需要落盘时，显式调用`ct.write_aiger(optimized_aig, filename='/path/result.aag')`指定保存位置。
+
 

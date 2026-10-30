@@ -1,0 +1,20 @@
+# PPO 小规模试跑；路径支持 ~ 和环境变量，相对路径以此文件所在目录为准。
+model_config: ~/runs/circuit-transformer/20261023-173337-deepsyn_8i2o_1/resolved_config.yaml
+checkpoint: ~/runs/circuit-transformer/20261023-173337-deepsyn_8i2o_1/ckpt/model-0010.pt  #选第10轮的
+
+data_dir: ~/data/circuit-transformer/train/8_inputs_2_outputs_random_deepsyn
+output_dir: ~/runs/circuit-transformer/ppo-{timestamp}_1
+device: cuda:1
+# 首次实验使用 float32；采样和更新采用相同精度。
+mixed_precision: false
+seed: 42
+num_circuits: 32       # 一轮采集的不同电路数量
+samples_per_circuit: 2 # 每个电路采样次数，至少 2
+max_length: 200
+failure_penalty: 10.0  # 未完成或不等价时奖励为 -10
+temperature: 1.0
+ppo_epochs: 2          # 对同一批轨迹重复更新的次数
+minibatch_size: 4      # 每次参数更新的轨迹数
+learning_rate: 0.000001
+clip_ratio: 0.2
+max_grad_norm: 1.0

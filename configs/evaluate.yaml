@@ -13,7 +13,7 @@ data_dir: ~/data/circuit-transformer/test
 # 每次运行生成新目录，避免覆盖结果。输出 results.csv 和 summary.json。
 output_dir: ~/runs/circuit-transformer/20261023-173337-deepsyn_8i2o_1/test-{timestamp}
 
-device: cuda       # 使用 GPU；无 GPU 时改为 cpu
-batch_size: 256    # 显存不足时调小，例如 32
+device: cuda:1     # 使用 GPU；无 GPU 时改为 cpu
+batch_size: 128    # 显存不足时调小，例如 32
 limit: null       # null = 全部测试；先试跑可设为 32（按文件名排序取前 32 条）
 mcts_steps: 0      # 0 = 不启用 MCTS；1 = 启用，耗时会增加
