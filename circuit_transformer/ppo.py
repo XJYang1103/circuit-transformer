@@ -1,6 +1,5 @@
 """Small on-policy PPO fine-tuning for constrained circuit generation."""
 import json
-import random
 
 import numpy as np
 import torch

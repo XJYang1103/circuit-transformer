@@ -1,0 +1,32 @@
+# 【双卡 PPO 专用】单卡仍使用 ppo.yaml 和 scripts/train_ppo.py。
+# 启动：python -u scripts/train_ppo_dual_gpu.py（自动启动两个 DDP 进程）
+model_config: ~/runs/circuit-transformer/20261023-173337-deepsyn_8i2o_1/resolved_config.yaml
+checkpoint: ~/runs/circuit-transformer/20261023-173337-deepsyn_8i2o_1/ckpt/model-0010.pt
+
+data_dir: ~/data/circuit-transformer/train/8_inputs_2_outputs_random_deepsyn
+output_dir: ~/runs/circuit-transformer/ppo-dual-gpu-{timestamp}_all_data
+
+# 两个进程分别绑定第一、第二张可见显卡，不要填 cuda:1。
+# 用 CUDA_VISIBLE_DEVICES=0,1 可选择要使用的物理显卡。
+device: cuda
+world_size: 2
+mixed_precision: true # FP16 + 动态梯度缩放，使用 V100 Tensor Core
+seed: 42
+num_circuits: null      # null = 遍历全部训练 JSON；设为 32 可试跑
+data_epochs: 1         # 完整遍历次数
+rollout_batch_size: 128 # 两卡合计电路数，每卡通常处理 64 个
+sampling_batch_size: 32 # 每张卡同时生成的轨迹数（含同一电路的多次采样）
+samples_per_circuit: 2  # 同一电路的所有采样由同一张卡完成
+ppo_epochs: 2          # 每批轨迹重复更新次数
+minibatch_size: 32     # 两卡合计有效训练 batch，必须为正偶数
+train_microbatch_size: 16 # 每张卡一次前向/反向的轨迹数；不足有效 batch 时累积梯度
+save_every_batches: 10 # 每 10 批和每次数据遍历结束后保存（与打印频率独立）
+log_every_batches: 10  # 每 10 批打印一次进度和吞吐量；首批、末批也打印
+log_every_updates: 100 # 每 100 次参数更新打印一次指标
+log_every_checkpoints: 10 # 每保存 10 次检查点打印一次提示；启动和遍历结束也打印
+max_length: 200
+temperature: 1.0
+failure_penalty: 10.0
+learning_rate: 0.000001
+clip_ratio: 0.2
+max_grad_norm: 1.0

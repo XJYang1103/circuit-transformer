@@ -450,33 +450,57 @@ python -u scripts/evaluate.py
 
 要测试 PPO 权重时，把 checkpoint 改为对应的 ppo-<时间戳>/model-ppo.pt 即可；config 仍使用原训练实验的 resolved_config.yaml，因为 PPO 微调沿用了相同的模型结构。
 
-# 3.PPO 小规模微调
+# 3.PPO 遍历训练数据微调
 
-PPO 配置在 `configs/ppo.yaml`，启动入口是 `scripts/train_ppo.py`。默认加载第 10 轮权重，从训练目录随机抽取 32 个电路，每个采样 2 条生成轨迹，随后使用同一批轨迹更新 2 轮。这里的“一轮 PPO”指一次轨迹采集及其更新，不是遍历完整训练集。
+PPO 配置在 `configs/ppo.yaml`，启动入口是 `scripts/train_ppo.py`。默认加载第 10 轮权重，完整遍历 `data_dir` 目录直接包含的全部 JSON 文件一次（不递归子目录）。每批读取 32 个电路，每个电路采样 2 条轨迹，对这一批轨迹更新 2 轮后释放轨迹，再用更新后的模型采样下一批。测试集不要放入该训练目录。
 
 在项目根目录、已激活训练环境后运行：
 
 ```bash
-python scripts/train_ppo.py --dry-run  # 检查配置和路径，不训练
-python -u scripts/train_ppo.py          # 正式运行
+python scripts/train_ppo.py --dry-run  # 检查配置和路径，不训练、不扫描全部文件
+python -u scripts/train_ppo.py          # 正式遍历训练数据
 ```
 
 也可在 IDE 打开 `scripts/train_ppo.py` 并点击运行；或通过 `--config /path/ppo.yaml` 指定另一份配置。设备、采样数量、更新次数、学习率等都在 YAML 中修改。默认使用 `cuda:1` 和 float32，显存不足可先减小电路数量或切换设备；更新逐条轨迹计算梯度，`minibatch_size` 控制累积后每次更新的轨迹数。
+
+关键配置如下：
+
+```yaml
+num_circuits: null      # 全部电路；设为 32 可抽样试跑
+data_epochs: 1         # 完整遍历次数
+rollout_batch_size: 32  # 每批电路数，控制内存中的轨迹数量
+samples_per_circuit: 2 # 每个电路的采样次数，至少 2
+ppo_epochs: 2          # 对每批轨迹重复更新次数
+minibatch_size: 4      # 每次参数更新使用的轨迹数
+save_every_batches: 10 # 每完成 10 批采样及更新保存一次；每次遍历结束也保存
+```
+
+完整遍历时，程序先把文件路径按扫描顺序写入 `data_manifest.jsonl`，不把全部文件名或全部轨迹放进内存。后续遍历与断点续训使用该固定顺序。最后一批不足 32 个电路也会处理。训练期间请保持清单和源数据不变。
+
+断点续训使用训练状态文件（将路径替换为实际目录）：
+
+```bash
+python -u scripts/train_ppo.py --resume "$HOME/runs/circuit-transformer/ppo-<时间戳>_1/trainer-latest.pt"
+```
+
+`--resume` 自动使用状态文件中保存的配置和原输出目录，不读取当前 YAML 的改动。它恢复模型、优化器、随机数状态以及数据清单位置；中断后从最近一次保存的完整批次继续，未保存的批次会重新执行，对应日志会回退后重写。`model-latest.pt` 是最近保存的推理权重，`model-ppo.pt` 在全部遍历完成后生成；这两个文件不用于断点续训。
 
 程序执行顺序和数据流：
 
 ```text
 configs/ppo.yaml + 训练的 resolved_config.yaml + model-0010.pt
-  → scripts/train_ppo.py：检查配置，扫描训练 JSON，抽取原始电路
+  → scripts/train_ppo.py：检查配置，把训练 JSON 路径写入清单
+  → ppo_training.py：按清单分批读取原始电路
   → circuit_transformer/ppo.py：编码电路，创建 LogicNetworkEnv
   → Circuit Transformer：用合法动作掩码逐 token 采样，记录旧策略概率
   → LogicNetworkEnv：构建电路，检查完成情况和真值表，统计 AND 门数
   → 同一电路的其他采样结果构成基线，计算优势
   → PPO 裁剪目标：重新计算动作概率、反向传播、更新参数
+  → 释放本批轨迹，继续下一批；按配置间隔保存训练状态
   → 新输出目录：model-ppo.pt、resolved_ppo.yaml、rollouts.jsonl、metrics.json
 ```
 
-成功生成并且真值表等价时，奖励为原始 AND 数减生成 AND 数；失败或不等价时奖励为 `-failure_penalty`。日志中的 reward 是采样时的奖励，`approx_kl` 和 `clip_fraction` 用于观察策略变化。每个输入电路的采样奖励完全相同时，该组优势为零，不产生策略梯度。扫描数百万个文件可能耗时，采样和更新逐条处理，首次试跑也可能较慢。输出权重只包含模型参数，不包含优化器状态，不能无缝恢复 PPO 更新。
+成功生成并且真值表等价时，奖励为原始 AND 数减生成 AND 数；失败或不等价时奖励为 `-failure_penalty`。日志中的 reward 是采样时的奖励，`approx_kl` 和 `clip_fraction` 用于观察策略变化。每个输入电路的采样奖励完全相同时，该组优势为零，不产生策略梯度。扫描数百万个文件可能耗时，采样和更新逐条处理，首次试跑也可能较慢。`trainer-latest.pt` 保存可恢复的训练状态；`model-ppo.pt` 只保存用于评估的模型权重。
 
 PPO 默认输出目录格式如下，每次运行都会创建一个新的目录：
 
@@ -485,16 +509,24 @@ PPO 默认输出目录格式如下，每次运行都会创建一个新的目录�
 ├── ppo-20261030-.../             # 一次 PPO 运行
 │   ├── model-ppo.pt              # PPO 微调后的模型权重
 │   ├── resolved_ppo.yaml         # 本次运行使用的完整 PPO 配置
+│   ├── data_manifest.jsonl       # 固定的训练文件顺序
+│   ├── trainer-latest.pt         # 最近保存的模型、优化器、随机数及进度
+│   ├── model-latest.pt           # 最近保存的推理权重
+│   ├── summary.json              # 全部遍历完成后的进度汇总
 │   ├── rollouts.jsonl            # 每条采样轨迹的奖励、成功情况和门数
 │   └── metrics.json              # 每次参数更新的损失和其他指标
 └── ppo-20261030-.../             # 另一次 PPO 运行
     ├── model-ppo.pt
     ├── resolved_ppo.yaml
+    ├── data_manifest.jsonl
+    ├── trainer-latest.pt
+    ├── model-latest.pt
+    ├── summary.json
     ├── rollouts.jsonl
     └── metrics.json
 ```
 
-评估时，将 `configs/evaluate.yaml` 的 `checkpoint` 指向新目录的 `model-ppo.pt`，原训练 `config` 不变；使用相同测试集分别评估原始权重和 PPO 权重。评估集不要用于 PPO 采样。`rollouts.jsonl` 保存每条轨迹的文件路径、奖励、成功情况和门数，`metrics.json` 保存每次更新的损失、近似 KL、裁剪比例及梯度范数。
+评估时，将 `configs/evaluate.yaml` 的 `checkpoint` 指向新目录的 `model-ppo.pt`，原训练 `config` 不变；使用相同测试集分别评估原始权重和 PPO 权重。评估集不要用于 PPO 采样。`rollouts.jsonl` 保存每条轨迹的文件路径、奖励、成功情况和门数，`metrics.json` 保存每次更新的损失、近似 KL、裁剪比例及梯度范数。两类记录都带有 `data_epoch`（数据遍历轮次）和 `rollout_batch`（采样批次）；指标中的 `epoch` 是当前采样批内部的 PPO 更新轮次，`update` 是累计参数更新次数。日志增量写入磁盘，训练状态定期覆盖保存。
 
 
 # 数据与输出目录
@@ -541,6 +573,11 @@ Circuit Transformer/                       # 项目目录
 |
 └─ ppo-<时间戳>_1/              # 一次 PPO 运行，与训练实验目录同级
     ├── resolved_ppo.yaml       # 本次 PPO 实际使用的配置
+    ├── data_manifest.jsonl     # 训练文件清单
+    ├── trainer-latest.pt       # 断点续训状态
+    ├── model-latest.pt         # 最近保存的推理权重
+    ├── rollouts.jsonl          # 采样结果
+    ├── summary.json            # 全部遍历完成后的进度汇总
     ├── metrics.json            # 每次参数更新的损失和其他指标
     └── model-ppo.pt            # PPO 微调后的模型权重
     └── test-<时间戳>/
